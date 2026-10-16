@@ -29,7 +29,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v3.0';
+    var VERSION = 'v3.1';
     var PORT = 8096;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -130,6 +130,35 @@
         next();
     }
 
+    // Measure achievable rate of the dbus->png->read cycle on this TV.
+    function bench(dir, n, cb) {
+        var file = 't3bench';
+        var target = dir + '/' + file + '.png';
+        try { fs.writeFileSync(target, ''); fs.chmodSync(target, 0x1b6); } catch (e) {}
+        var samples = []; var i = 0;
+        var args = ['--system', '--print-reply', '--reply-timeout=4000', '--type=method_call',
+            '--dest=' + NAME, OBJ, METHOD, 'int32:0', 'int32:0', 'int32:0',
+            'int32:0', 'int32:0', 'int32:90', 'string:' + dir, 'string:' + file];
+        function one() {
+            if (i >= n) {
+                var tot = 0, mn = 1e9, mx = 0;
+                for (var k = 0; k < samples.length; k++) { tot += samples[k]; if (samples[k] < mn) mn = samples[k]; if (samples[k] > mx) mx = samples[k]; }
+                var avg = samples.length ? tot / samples.length : 0;
+                cb({ dir: dir, n: samples.length, ms_avg: Math.round(avg), ms_min: mn, ms_max: mx,
+                    fps_avg: avg ? +(1000 / avg).toFixed(1) : 0, samples_ms: samples });
+                return;
+            }
+            i++;
+            var t0 = Date.now();
+            cp.execFile(DBUS, args, { timeout: 6000, maxBuffer: 1 << 20 }, function () {
+                try { fs.readFileSync(target); } catch (e) {}
+                samples.push(Date.now() - t0);
+                one();
+            });
+        }
+        one();
+    }
+
     function send(res, code, obj) {
         res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify(obj, null, 2));
@@ -158,6 +187,11 @@
                 } else {
                     grabSweep(function (out) { send(res, 200, out); });
                 }
+                return;
+            }
+            if (url.indexOf('/bench') === 0) {
+                var qb = parseQ(url);
+                bench(qb.dir || '/tmp', +(qb.n || 10), function (r) { send(res, 200, r); });
                 return;
             }
             if (url.indexOf('/sweep') === 0) {
