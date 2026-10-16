@@ -19,6 +19,45 @@ nativa `dlopen` + ioctl).
 > Il probe **legge soltanto** i device (stat + open in sola lettura/lettura-scrittura).
 > Non esegue nessuna cattura e non modifica nulla sul televisore.
 
+## Stato
+
+- **v1 — gate dei device: VERDE.** Su UE55MU6120 l'app auto-firmata apre
+  `/dev/dri/card1`, `/dev/dri/card0` e la shm `shm_libsecv_capture` in
+  lettura/scrittura (nodi `0666`). Label SMACK del processo: `User::Pkg::<id>`.
+- **v2 — cattura via D-Bus (questa versione).** Prova a ottenere davvero un
+  frame **senza codice nativo**, chiedendolo al servizio di sistema
+  `display-capture-service` con `/usr/bin/dbus-send`.
+
+## Cattura via D-Bus (v2)
+
+Metodo ricavato dal demone `/usr/bin/display-capture-service`:
+
+```
+interfaccia : samsung.tizen.dcapture        (alt. org.volt.FirstScreen)
+oggetto     : /samsung/tizen/dcapture       (alt. /org/volt/FirstScreen)
+metodo RequestCaptureToFileSync(
+    i app_type, i capture_mode, i comp_type, i width, i height,
+    i jpeg_quality, s dir_path, s file_name)
+  -> i retVal, i ret_width, i ret_height, s ret_path
+```
+
+Il demone rende lo schermo in PNG/JPEG nel file indicato e ne restituisce il
+percorso. Il servizio del modulo invoca il metodo con `dbus-send` provando in
+sequenza bus (system/session), nome (dcapture/FirstScreen) e qualche valore di
+`app_type`/`capture_mode`, poi legge il file prodotto.
+
+Dalla UI del modulo premi **ENTER** per tentare la cattura; l'immagine appare a
+schermo. Da browser LAN: `http://<IP-TV>:8095/sweep` e poi `http://<IP-TV>:8095/img`.
+
+Esiti possibili:
+- **CATTURA RIUSCITA** → otteniamo frame via D-Bus senza compilare nulla. Da qui
+  si può già fare un ambilight a basso frame-rate; per alta frequenza si passa
+  poi alla via nativa (`secvideo_api_capture_screen` in shm).
+- **dbus-send non eseguibile** → il sandbox non ci lascia lanciare binari di
+  sistema; si valuta la via nativa o le alternative.
+- **nessuna cattura** → il metodo risponde errore o la policy D-Bus nega la
+  chiamata: nel JSON ci sono `exit`, `stderr` e `reply` di ogni tentativo.
+
 ## Cosa fa
 
 Un servizio Node (eseguito da TizenBrew sul TV) raccoglie:

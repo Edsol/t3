@@ -7,63 +7,68 @@
 <style>
   html,body{margin:0;height:100%;background:#0b0f1a;color:#e7edf7;
     font-family:Arial,Helvetica,sans-serif;}
-  .wrap{padding:36px 48px;}
-  h1{font-size:34px;margin:0 0 6px;}
-  .sub{color:#8ea0bd;font-size:18px;margin-bottom:22px;}
-  .verdict{font-size:30px;font-weight:bold;padding:18px 22px;border-radius:12px;
-    background:#162036;border:2px solid #2a3a5c;margin-bottom:22px;}
+  .wrap{padding:30px 44px;}
+  h1{font-size:30px;margin:0 0 4px;}
+  .sub{color:#8ea0bd;font-size:17px;margin-bottom:18px;}
+  .verdict{font-size:26px;font-weight:bold;padding:16px 20px;border-radius:12px;
+    background:#162036;border:2px solid #2a3a5c;margin-bottom:16px;}
   .ok{color:#49d17a;border-color:#2e7d50;}
   .bad{color:#ff6b6b;border-color:#7d2e2e;}
   .warn{color:#ffd166;border-color:#7d6a2e;}
-  pre{font-size:15px;line-height:1.35;background:#0f1626;border:1px solid #223049;
-    border-radius:10px;padding:16px;white-space:pre-wrap;word-break:break-word;
-    max-height:52vh;overflow:auto;}
-  .hint{color:#8ea0bd;font-size:16px;margin-top:16px;}
+  .row{display:flex;gap:18px;}
+  .col{flex:1;}
+  img{max-width:100%;border:1px solid #223049;border-radius:10px;background:#000;}
+  pre{font-size:13px;line-height:1.3;background:#0f1626;border:1px solid #223049;
+    border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-word;
+    max-height:46vh;overflow:auto;}
+  .hint{color:#8ea0bd;font-size:15px;margin-top:12px;}
   b{color:#cfe0ff;}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>HyperTizen&nbsp;&middot;&nbsp;Tizen&nbsp;3 capture probe</h1>
-  <div class="sub">Legge solo i device, non cattura nulla. Premi <b>ENTER</b> per ri-eseguire.</div>
-  <div id="verdict" class="verdict">Lettura in corso&hellip;</div>
-  <pre id="dump">&hellip;</pre>
-  <div class="hint">Risultato completo anche da telefono/PC: <b>http://&lt;IP-della-TV&gt;:8095</b></div>
+  <h1>HyperTizen&nbsp;&middot;&nbsp;Tizen&nbsp;3 capture test</h1>
+  <div class="sub">Premi <b>ENTER</b> per tentare una cattura via D-Bus (RequestCaptureToFileSync).</div>
+  <div id="verdict" class="verdict">Pronto. Premi ENTER per catturare&hellip;</div>
+  <div class="row">
+    <div class="col"><img id="shot" alt="(nessuna immagine)"></div>
+    <div class="col"><pre id="dump">&hellip;</pre></div>
+  </div>
+  <div class="hint">Anche da telefono/PC: <b>http://&lt;IP-TV&gt;:8095/sweep</b> poi <b>/img</b></div>
 </div>
 <script>
 (function(){
-  var URL='http://127.0.0.1:8095/';
-  function cls(v){
-    if(!v) return 'verdict';
-    if(v.indexOf('OPEN-OK')>=0) return 'verdict ok';
-    if(v.indexOf('BLOCKED')>=0||v.indexOf('absent')>=0) return 'verdict bad';
-    return 'verdict warn';
+  var BASE='http://127.0.0.1:8095';
+  function setV(t,c){var e=document.getElementById('verdict');e.textContent=t;e.className='verdict '+(c||'');}
+  function getJSON(path,cb){
+    var x=new XMLHttpRequest();x.open('GET',BASE+path,true);
+    x.onreadystatechange=function(){if(x.readyState===4)cb(x.status,x.responseText);};
+    try{x.send();}catch(e){cb(0,'');}
   }
-  function load(refresh){
-    var x=new XMLHttpRequest();
-    x.open('GET', URL+(refresh?'refresh':''), true);
-    x.onreadystatechange=function(){
-      if(x.readyState!==4) return;
-      if(x.status===200){
-        var d; try{d=JSON.parse(x.responseText);}catch(e){d=null;}
-        var vEl=document.getElementById('verdict');
-        vEl.textContent = d&&d.verdict ? d.verdict : '(risposta non valida)';
-        vEl.className = cls(d&&d.verdict);
-        document.getElementById('dump').textContent = x.responseText;
+  function env(){
+    getJSON('/',function(st,txt){
+      if(st!==200){setV('Servizio non raggiungibile. Avvia il modulo in TizenBrew.','warn');return;}
+      setV('Pronto. Premi ENTER per catturare…');
+      document.getElementById('dump').textContent=txt;
+    });
+  }
+  function sweep(){
+    setV('Cattura in corso… (provo i vari parametri)','warn');
+    getJSON('/sweep',function(st,txt){
+      var d;try{d=JSON.parse(txt);}catch(e){d=null;}
+      document.getElementById('dump').textContent=txt;
+      if(d&&d.success){
+        setV('CATTURA RIUSCITA  '+(d.winner.reply?('('+d.winner.reply.ret_w+'x'+d.winner.reply.ret_h+')'):''),'ok');
+        var img=document.getElementById('shot');img.src=BASE+'/img?ts='+Date.now();
+      } else if(d&&d.fatal){
+        setV('dbus-send non eseguibile: '+d.fatal,'bad');
       } else {
-        document.getElementById('verdict').textContent =
-          'Servizio non raggiungibile. Avvia il servizio del modulo in TizenBrew.';
-        document.getElementById('verdict').className='verdict warn';
+        setV('Nessuna cattura prodotta ('+(d?d.tried:'?')+' tentativi). Vedi dettagli.','bad');
       }
-    };
-    try{x.send();}catch(e){}
+    });
   }
-  document.addEventListener('keydown', function(e){
-    // Enter / OK or RED button -> refresh
-    if(e.keyCode===13||e.keyCode===403) load(true);
-  });
-  load(false);
-  setTimeout(function(){load(false);}, 2500);
+  document.addEventListener('keydown',function(e){if(e.keyCode===13||e.keyCode===403)sweep();});
+  env();
 })();
 </script>
 </body>
