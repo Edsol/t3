@@ -63,6 +63,27 @@ Esiti possibili:
 - **nessuna cattura** → il metodo risponde errore o la policy D-Bus nega la
   chiamata: nel JSON ci sono `exit`, `stderr` e `reply` di ogni tentativo.
 
+## Aggiornare il modulo (evitare la cache di jsDelivr)
+
+TizenBrew scarica i moduli da jsDelivr, che tiene in cache a lungo il percorso
+senza versione (`gh/Edsol/t3`). Per avere subito l'ultima versione, **aggiungi
+il modulo con un tag**, es. `Edsol/t3@t2`: i tag sono immutabili e non passano
+dalla cache vecchia. Ad ogni nuova versione si usa un tag nuovo (`t3`, `t4`, …).
+
+Inoltre il servizio apre un server sulla porta **8096**; se in TizenBrew gira
+ancora una versione precedente, la porta resta occupata e vince la vecchia.
+Perciò, quando aggiorni: **esci del tutto da TizenBrew (o riavvia il TV)**,
+poi rilancia il modulo col tag nuovo.
+
+## Endpoint utili (porta 8096)
+
+- `GET /`        — ambiente + cartelle scrivibili (campo `version`)
+- `GET /grab`    — pre-crea il file e cattura, provando più cartelle; poi `/img`
+- `GET /grab?dir=/tmp&app=0&mode=0` — singolo tentativo esplicito
+- `GET /img`     — l'ultima immagine catturata
+- `GET /bench?dir=/tmp&n=10` — misura ms e fps reali del ciclo cattura su questo TV
+- `GET /sweep`   — singola chiamata D-Bus di diagnostica
+
 ## Cosa fa
 
 Un servizio Node (eseguito da TizenBrew sul TV) raccoglie:
