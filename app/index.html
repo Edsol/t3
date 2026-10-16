@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1280,initial-scale=1">
+<title>HyperTizen T3 Probe</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f1a;color:#e7edf7;
+    font-family:Arial,Helvetica,sans-serif;}
+  .wrap{padding:36px 48px;}
+  h1{font-size:34px;margin:0 0 6px;}
+  .sub{color:#8ea0bd;font-size:18px;margin-bottom:22px;}
+  .verdict{font-size:30px;font-weight:bold;padding:18px 22px;border-radius:12px;
+    background:#162036;border:2px solid #2a3a5c;margin-bottom:22px;}
+  .ok{color:#49d17a;border-color:#2e7d50;}
+  .bad{color:#ff6b6b;border-color:#7d2e2e;}
+  .warn{color:#ffd166;border-color:#7d6a2e;}
+  pre{font-size:15px;line-height:1.35;background:#0f1626;border:1px solid #223049;
+    border-radius:10px;padding:16px;white-space:pre-wrap;word-break:break-word;
+    max-height:52vh;overflow:auto;}
+  .hint{color:#8ea0bd;font-size:16px;margin-top:16px;}
+  b{color:#cfe0ff;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>HyperTizen&nbsp;&middot;&nbsp;Tizen&nbsp;3 capture probe</h1>
+  <div class="sub">Legge solo i device, non cattura nulla. Premi <b>ENTER</b> per ri-eseguire.</div>
+  <div id="verdict" class="verdict">Lettura in corso&hellip;</div>
+  <pre id="dump">&hellip;</pre>
+  <div class="hint">Risultato completo anche da telefono/PC: <b>http://&lt;IP-della-TV&gt;:8095</b></div>
+</div>
+<script>
+(function(){
+  var URL='http://127.0.0.1:8095/';
+  function cls(v){
+    if(!v) return 'verdict';
+    if(v.indexOf('OPEN-OK')>=0) return 'verdict ok';
+    if(v.indexOf('BLOCKED')>=0||v.indexOf('absent')>=0) return 'verdict bad';
+    return 'verdict warn';
+  }
+  function load(refresh){
+    var x=new XMLHttpRequest();
+    x.open('GET', URL+(refresh?'refresh':''), true);
+    x.onreadystatechange=function(){
+      if(x.readyState!==4) return;
+      if(x.status===200){
+        var d; try{d=JSON.parse(x.responseText);}catch(e){d=null;}
+        var vEl=document.getElementById('verdict');
+        vEl.textContent = d&&d.verdict ? d.verdict : '(risposta non valida)';
+        vEl.className = cls(d&&d.verdict);
+        document.getElementById('dump').textContent = x.responseText;
+      } else {
+        document.getElementById('verdict').textContent =
+          'Servizio non raggiungibile. Avvia il servizio del modulo in TizenBrew.';
+        document.getElementById('verdict').className='verdict warn';
+      }
+    };
+    try{x.send();}catch(e){}
+  }
+  document.addEventListener('keydown', function(e){
+    // Enter / OK or RED button -> refresh
+    if(e.keyCode===13||e.keyCode===403) load(true);
+  });
+  load(false);
+  setTimeout(function(){load(false);}, 2500);
+})();
+</script>
+</body>
+</html>
