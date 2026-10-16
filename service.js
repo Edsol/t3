@@ -31,7 +31,8 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var PORT = 8095;
+    var VERSION = 'v2.1';
+    var PORT = 8096; // v1 used 8095; use a fresh port so a stale v1 server never shadows v2
     var DBUS = '/usr/bin/dbus-send';
     var IFACE = 'samsung.tizen.dcapture';
     var OBJ = '/samsung/tizen/dcapture';
@@ -174,7 +175,7 @@
                 runCapture(bus, useAlt, p, function (r) { send(res, 200, r); });
                 return;
             }
-            send(res, 200, { ok: true, env: envProbe(),
+            send(res, 200, { ok: true, version: VERSION, port: PORT, env: envProbe(),
                 hint: 'GET /sweep to attempt a capture, then GET /img to view it' });
         });
         server.on('error', function (e) { try { console.log('[t3-probe] http err ' + e.code); } catch (i) {} });

@@ -1,6 +1,6 @@
 {
   "name": "hypertizen-t3-probe",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "appName": "HyperTizen T3 Probe",
   "description": "Minimal probe: can a self-signed app on Tizen 3 reach the SDP HW capture device used by secvideo_api_capture_screen?",
   "packageType": "app",

@@ -47,7 +47,12 @@ sequenza bus (system/session), nome (dcapture/FirstScreen) e qualche valore di
 `app_type`/`capture_mode`, poi legge il file prodotto.
 
 Dalla UI del modulo premi **ENTER** per tentare la cattura; l'immagine appare a
-schermo. Da browser LAN: `http://<IP-TV>:8095/sweep` e poi `http://<IP-TV>:8095/img`.
+schermo. Da browser LAN: `http://<IP-TV>:8096/sweep` e poi `http://<IP-TV>:8096/img`.
+
+> La v2 usa la porta **8096** (la v1 usava 8095). Se vedi ancora il vecchio
+> output con `verdict`, è la v1 rimasta in esecuzione: **esci del tutto da
+> TizenBrew (o riavvia il TV)** per chiuderla, poi lancia solo `Edsol/t3`.
+> Verifica la versione aprendo `http://<IP-TV>:8096/` → campo `version: v2.x`.
 
 Esiti possibili:
 - **CATTURA RIUSCITA** → otteniamo frame via D-Bus senza compilare nulla. Da qui
