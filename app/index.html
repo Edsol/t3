@@ -53,17 +53,16 @@
     });
   }
   function sweep(){
-    setV('Cattura in corso… (provo i vari parametri)','warn');
-    getJSON('/sweep',function(st,txt){
+    setV('Cattura in corso…','warn');
+    getJSON('/grab',function(st,txt){
       var d;try{d=JSON.parse(txt);}catch(e){d=null;}
       document.getElementById('dump').textContent=txt;
       if(d&&d.success){
-        setV('CATTURA RIUSCITA  '+(d.winner.reply?('('+d.winner.reply.ret_w+'x'+d.winner.reply.ret_h+')'):''),'ok');
+        var w=d.winner;
+        setV('CATTURA RIUSCITA  '+(w.reply?('('+w.reply.ret_w+'x'+w.reply.ret_h+') '):'')+'da '+w.dir,'ok');
         var img=document.getElementById('shot');img.src=BASE+'/img?ts='+Date.now();
-      } else if(d&&d.fatal){
-        setV('dbus-send non eseguibile: '+d.fatal,'bad');
       } else {
-        setV('Nessuna cattura prodotta ('+(d?d.tried:'?')+' tentativi). Vedi dettagli.','bad');
+        setV('Cattura ok dal demone, ma file non leggibile in nessuna cartella. Vedi dettagli.','bad');
       }
     });
   }
