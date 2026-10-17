@@ -31,7 +31,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v4.0';
+    var VERSION = 'v4.1';
     var PORT = 8097;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -68,7 +68,29 @@
         return o;
     }
 
-    function readShm() { return fs.readFileSync(SHM); }
+    function readShm(path) { return fs.readFileSync(path || SHM); }
+
+    // list every /dev/shm entry with size + first 32 bytes, flag frame-sized ones
+    function listShms() {
+        var out = [];
+        var names;
+        try { names = fs.readdirSync('/dev/shm'); } catch (e) { return { err: e.code || String(e) }; }
+        for (var i = 0; i < names.length; i++) {
+            var p = '/dev/shm/' + names[i];
+            var row = { name: names[i], path: p };
+            try {
+                var st = fs.statSync(p);
+                row.size = st.size;
+                // frame-size hints for 480x270
+                row.looks = (st.size >= 120000) ? 'frame-sized?' : '';
+                var fd = fs.openSync(p, 'r'); var hb = new Buffer(32); var n = fs.readSync(fd, hb, 0, 32, 0); fs.closeSync(fd);
+                row.head = hb.slice(0, n).toString('hex');
+            } catch (e) { row.err = e.code || String(e); }
+            out.push(row);
+        }
+        out.sort(function (a, b) { return (b.size || 0) - (a.size || 0); });
+        return out;
+    }
 
     // Build a 24-bit BMP (bottom-up) from a grayscale plane: buf[off + y*w + x] = luma.
     function bmpFromLuma(buf, off, w, h) {
@@ -120,6 +142,15 @@
                 return;
             }
 
+            if (url.indexOf('/shms') === 0) {
+                // trigger a capture, then list all /dev/shm with sizes so we can
+                // spot which buffer holds the frame (changes size / is frame-sized)
+                dbusCapture('/tmp', 't3cap', 0, 0, 0, 0, 0, 90, function (rep) {
+                    send(res, 200, { version: VERSION, capture: rep, shms: listShms() });
+                });
+                return;
+            }
+
             if (url.indexOf('/shminfo') === 0) {
                 dbusCapture('/tmp', 't3cap', 0, 0, 0, 0, 0, 90, function (rep) {
                     send(res, 200, { version: VERSION, capture: rep, shm: SHM, shmInfo: shmInfo() });
@@ -132,10 +163,11 @@
                 var off = +(q.off || 0);
                 var w = +(q.w || 480), h = +(q.h || 270);
                 var bus = q.bus === undefined ? '1' : q.bus;
+                var shmPath = q.shm ? ('/dev/shm/' + q.shm.replace(/^.*\//, '')) : SHM;
                 function build() {
-                    var r = { version: VERSION, off: off, w: w, h: h };
+                    var r = { version: VERSION, off: off, w: w, h: h, shm: shmPath };
                     try {
-                        var buf = readShm();
+                        var buf = readShm(shmPath);
                         r.shmSize = buf.length;
                         if (off + w * h > buf.length) { r.error = 'offset+w*h exceeds shm size'; send(res, 200, r); return; }
                         var min = 255, max = 0, sum = 0, cnt = 0, step = Math.max(1, Math.floor((w * h) / 4096));
