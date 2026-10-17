@@ -34,11 +34,11 @@
     <div class="col"><img id="shot" alt="(nessuna immagine)"></div>
     <div class="col"><pre id="dump">&hellip;</pre></div>
   </div>
-  <div class="hint">Da browser LAN: <b>:8097/shminfo</b> &middot; <b>:8097/shot?off=0</b> &middot; <b>:8097/img</b></div>
+  <div class="hint">Da browser LAN: <b>:8098/shminfo</b> &middot; <b>:8098/shot?off=0</b> &middot; <b>:8098/img</b></div>
 </div>
 <script>
 (function(){
-  var BASE='http://127.0.0.1:8097';
+  var BASE='http://127.0.0.1:8098';
   function setV(t,c){var e=document.getElementById('verdict');e.textContent=t;e.className='verdict '+(c||'');}
   function getJSON(path,cb){
     var x=new XMLHttpRequest();x.open('GET',BASE+path,true);
@@ -47,7 +47,7 @@
   }
   function env(){
     getJSON('/',function(st,txt){
-      if(st!==200){setV('Servizio non raggiungibile su :8097.','warn');return;}
+      if(st!==200){setV('Servizio non raggiungibile su :8098.','warn');return;}
       setV('Pronto. Premi ENTER…');
       document.getElementById('dump').textContent=txt;
     });

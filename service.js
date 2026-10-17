@@ -31,8 +31,8 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.0';
-    var PORT = 8097;
+    var VERSION = 'v5.1';
+    var PORT = 8098;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
     var OBJ = '/samsung/tizen/dcapture';
