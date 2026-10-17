@@ -31,7 +31,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.4';
+    var VERSION = 'v5.5';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -49,12 +49,20 @@
     // output is kept and later shown at GET /helper. Fully guarded so it can
     // never prevent the HTTP server from starting; invoked after listen().
     function runHelperOnce() {
-        var p = '/home/owner/share/tmp/t3cap';
-        helperReport = 'running ' + p + ' ...';
+        // The sdb-pushed file carries a different SMACK label, so the app cannot
+        // exec it (EPERM). Copy it into a file the app writes itself (same label
+        // as our process => exec allowed under SMACK), then run it.
+        var src = '/home/owner/share/tmp/t3cap';
+        var dst = (process.env.HOME || '/tmp') + '/t3run';
+        helperReport = 'preparing ' + dst + ' from ' + src;
         try {
-            try { fs.chmodSync(p, 0x1ed /* 0755 */); } catch (e) { helperReport = 'chmod: ' + (e.code || e); }
-            cp.execFile(p, [], { timeout: 20000, maxBuffer: 8 << 20 }, function (err, so, se) {
-                helperReport = 'exit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
+            var data;
+            try { data = fs.readFileSync(src); } catch (e) { helperReport = 'read src: ' + (e.code || e); return; }
+            try { fs.writeFileSync(dst, data); fs.chmodSync(dst, 0x1ed /* 0755 */); }
+            catch (e) { helperReport = 'write dst: ' + (e.code || e); return; }
+            cp.execFile(dst, [], { timeout: 20000, maxBuffer: 8 << 20 }, function (err, so, se) {
+                helperReport = 'src=' + src + ' dst=' + dst + ' size=' + data.length
+                    + '\nexit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
                     + '\n--- stdout ---\n' + String(so || '')
                     + '\n--- stderr ---\n' + String(se || '');
             });
