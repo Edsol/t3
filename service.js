@@ -44,21 +44,44 @@
 
     function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return '(' + e.code + ')'; } }
 
-    // Run once the probe helper the user placed on the device via `sdb push`
-    // (a fixed local path, not downloaded, not network-triggered). Its text
-    // output is kept and later shown at GET /helper. Fully guarded so it can
-    // never prevent the HTTP server from starting; invoked after listen().
+    // libpython2.7.so.1.0 esiste nel firmware ma il loader non la trova (exit
+    // 127): il processo lanciato dalla sandbox non eredita il search path giusto.
+    // Proviamo le dir di sistema note via LD_LIBRARY_PATH (sola lettura).
+    var PY_LIBDIRS = ['/usr/lib', '/lib', '/usr/lib/python2.7',
+        '/usr/lib/python2.7/lib-dynload', '/usr/lib/python2.7/config',
+        '/usr/local/lib', '/opt/usr/lib'];
+    function findPyLibDir() {
+        for (var i = 0; i < PY_LIBDIRS.length; i++) {
+            try { if (fs.statSync(PY_LIBDIRS[i] + '/libpython2.7.so.1.0').isFile()) return PY_LIBDIRS[i]; } catch (e) { }
+        }
+        try {
+            var names = fs.readdirSync('/usr/lib');
+            for (var j = 0; j < names.length; j++) if (names[j].indexOf('libpython2.7') === 0) return '/usr/lib';
+        } catch (e) { }
+        return null;
+    }
+    function pyEnv() {
+        var env = {}; for (var k in process.env) env[k] = process.env[k];
+        var dir = findPyLibDir();
+        env.LD_LIBRARY_PATH = (dir ? dir + ':' : '') + PY_LIBDIRS.join(':')
+            + (env.LD_LIBRARY_PATH ? ':' + env.LD_LIBRARY_PATH : '');
+        return env;
+    }
     function runHelperOnce() {
         var script = '/home/owner/share/tmp/cap.py';
-        helperReport = 'running system python on ' + script;
+        var env = pyEnv();
+        helperReport = 'running python on ' + script + '\nfound libdir=' + findPyLibDir()
+            + '\nLD_LIBRARY_PATH=' + env.LD_LIBRARY_PATH + '\n';
         try {
-            cp.execFile('/usr/bin/python2.7', [script], { timeout: 25000, maxBuffer: 8 << 20 }, function (err, so, se) {
-                helperReport = 'python exit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
-                    + '\n--- stdout ---\n' + String(so || '')
-                    + '\n--- stderr ---\n' + String(se || '');
-            });
+            cp.execFile('/usr/bin/python2.7', [script],
+                { timeout: 25000, maxBuffer: 8 << 20, env: env }, function (err, so, se) {
+                    helperReport += 'python exit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
+                        + '\n--- stdout ---\n' + String(so || '')
+                        + '\n--- stderr ---\n' + String(se || '');
+                });
         } catch (e) { helperReport = 'spawn error: ' + (e && e.stack || e); }
     }
+
 
     // fire one capture through the system service; cb(replyObj)
     function dbusCapture(dir, file, app, mode, w, h, comp, q, cb) {
