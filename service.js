@@ -167,6 +167,16 @@
             cb(null, out);
         },
         readhex: function (a, cb) {
+            // Guard: reading char/DRM devices with readSync hangs the whole Node
+            // event loop (no EOF). Refuse known-blocking device paths; only read
+            // regular files. This keeps the agent from locking up on probes.
+            if (/^\/dev\/(dri\/|mem$|kmem$|fb\d|watchdog)/.test(a.path)) {
+                return cb(new Error('refused: char/DRM device would block readSync (' + a.path + ')'));
+            }
+            try {
+                var st = fs.statSync(a.path);
+                if (!st.isFile()) return cb(new Error('refused: not a regular file (' + a.path + ')'));
+            } catch (e) { return cb(e); }
             var fd = fs.openSync(a.path, 'r');
             var len = a.len || 256; var buf = new Buffer(len);
             var n = fs.readSync(fd, buf, 0, len, a.off || 0); fs.closeSync(fd);
