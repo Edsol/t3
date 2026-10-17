@@ -31,7 +31,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v4.1';
+    var VERSION = 'v5.0';
     var PORT = 8097;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -121,6 +121,57 @@
         return out;
     }
 
+    // ---- native-feasibility probe (read-only): is the app dir mounted noexec,
+    // and does dlopen work at all from our process? Tells us if a native secvideo
+    // helper could run here, without copying or running any binary. ----
+    function candidateDirs() {
+        var l = []; function add(d) { if (d && l.indexOf(d) < 0) l.push(d); }
+        try { add(process.cwd()); } catch (e) {}
+        add(process.env.HOME); add(process.env.TMPDIR); add('/tmp');
+        add('/opt/usr/home/owner/share/tmp'); add('/opt/usr/apps');
+        return l;
+    }
+    function mountFor(dir) {
+        try {
+            var mi = fs.readFileSync('/proc/self/mountinfo', 'utf8').split('\n');
+            var best = null, bestLen = -1;
+            for (var i = 0; i < mi.length; i++) {
+                var mp = mi[i].split(' ')[4];
+                if (mp && dir.indexOf(mp) === 0 && mp.length > bestLen) { best = mi[i]; bestLen = mp.length; }
+            }
+            if (!best) return null;
+            return { mountpoint: best.split(' ')[4], noexec: best.indexOf('noexec') >= 0 };
+        } catch (e) { return { err: e.code || String(e) }; }
+    }
+    function dirWritable(dir) {
+        var p = dir + '/.t3w';
+        try { fs.writeFileSync(p, 'x'); var ok = fs.readFileSync(p, 'utf8') === 'x'; try { fs.unlinkSync(p); } catch (e) {} return ok; }
+        catch (e) { return e.code || String(e); }
+    }
+    function dlopenExisting() {
+        // load an existing system library (no copy, no chmod) to see whether
+        // dlopen is permitted for our process at all.
+        var libs = ['/usr/lib/libdrm.so.2', '/usr/lib/libteec.so', '/usr/lib/libpng.so.3', '/lib/libz.so.1'];
+        for (var i = 0; i < libs.length; i++) {
+            try { fs.statSync(libs[i]); } catch (e) { continue; }
+            try {
+                process.dlopen({ exports: {} }, libs[i]);
+                return { lib: libs[i], result: 'loaded (unexpected)' };
+            } catch (de) {
+                var m = String(de.message || de);
+                var ok = /self-register|NODE_MODULE|Module did|init|symbol/i.test(m);
+                return { lib: libs[i], result: ok ? 'dlopen-OK (loaded, not an addon)' : m.slice(0, 160) };
+            }
+        }
+        return { result: 'no candidate lib found' };
+    }
+    function nativeProbe() {
+        var o = { version: VERSION, dlopen: dlopenExisting(), dirs: {} };
+        var ds = candidateDirs();
+        for (var i = 0; i < ds.length; i++) o.dirs[ds[i]] = { writable: dirWritable(ds[i]), mount: mountFor(ds[i]) };
+        return o;
+    }
+
     function send(res, code, obj) {
         res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify(obj, null, 2));
@@ -139,6 +190,11 @@
             if (url.indexOf('/img') === 0) {
                 if (lastImage) { res.writeHead(200, { 'Content-Type': lastImage.ct, 'Access-Control-Allow-Origin': '*' }); res.end(lastImage.buf); }
                 else { res.writeHead(404); res.end('no image yet'); }
+                return;
+            }
+
+            if (url.indexOf('/native') === 0) {
+                send(res, 200, nativeProbe());
                 return;
             }
 
