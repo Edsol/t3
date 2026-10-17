@@ -31,8 +31,8 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.1';
-    var PORT = 8098;
+    var VERSION = 'v5.3';
+    var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
     var OBJ = '/samsung/tizen/dcapture';
@@ -40,8 +40,22 @@
     var SHM = '/dev/shm/shm_libsecv_capture';
 
     var lastImage = null; // { buf, ct }
+    var helperReport = 'helper not run yet';
 
     function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return '(' + e.code + ')'; } }
+
+    // Run once, at service startup, the probe helper the user placed on the device
+    // via `sdb push` (a fixed local path, not downloaded, not network-triggered).
+    // Its text output is kept and later shown at GET /helper.
+    (function runHelperOnce() {
+        var p = '/home/owner/share/tmp/t3cap';
+        try { fs.chmodSync(p, 0x1ed /* 0755 */); } catch (e) {}
+        cp.execFile(p, [], { timeout: 20000, maxBuffer: 8 << 20 }, function (err, so, se) {
+            helperReport = 'exit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
+                + '\n--- stdout ---\n' + String(so || '')
+                + '\n--- stderr ---\n' + String(se || '');
+        });
+    })();
 
     // fire one capture through the system service; cb(replyObj)
     function dbusCapture(dir, file, app, mode, w, h, comp, q, cb) {
@@ -195,6 +209,12 @@
 
             if (url.indexOf('/native') === 0) {
                 send(res, 200, nativeProbe());
+                return;
+            }
+
+            if (url.indexOf('/helper') === 0) {
+                res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+                res.end(helperReport);
                 return;
             }
 
