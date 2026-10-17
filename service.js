@@ -31,7 +31,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.3';
+    var VERSION = 'v5.4';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -44,18 +44,22 @@
 
     function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return '(' + e.code + ')'; } }
 
-    // Run once, at service startup, the probe helper the user placed on the device
-    // via `sdb push` (a fixed local path, not downloaded, not network-triggered).
-    // Its text output is kept and later shown at GET /helper.
-    (function runHelperOnce() {
+    // Run once the probe helper the user placed on the device via `sdb push`
+    // (a fixed local path, not downloaded, not network-triggered). Its text
+    // output is kept and later shown at GET /helper. Fully guarded so it can
+    // never prevent the HTTP server from starting; invoked after listen().
+    function runHelperOnce() {
         var p = '/home/owner/share/tmp/t3cap';
-        try { fs.chmodSync(p, 0x1ed /* 0755 */); } catch (e) {}
-        cp.execFile(p, [], { timeout: 20000, maxBuffer: 8 << 20 }, function (err, so, se) {
-            helperReport = 'exit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
-                + '\n--- stdout ---\n' + String(so || '')
-                + '\n--- stderr ---\n' + String(se || '');
-        });
-    })();
+        helperReport = 'running ' + p + ' ...';
+        try {
+            try { fs.chmodSync(p, 0x1ed /* 0755 */); } catch (e) { helperReport = 'chmod: ' + (e.code || e); }
+            cp.execFile(p, [], { timeout: 20000, maxBuffer: 8 << 20 }, function (err, so, se) {
+                helperReport = 'exit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
+                    + '\n--- stdout ---\n' + String(so || '')
+                    + '\n--- stderr ---\n' + String(se || '');
+            });
+        } catch (e) { helperReport = 'spawn error: ' + (e && e.stack || e); }
+    }
 
     // fire one capture through the system service; cb(replyObj)
     function dbusCapture(dir, file, app, mode, w, h, comp, q, cb) {
@@ -295,5 +299,6 @@
         });
         server.on('error', function (e) { try { console.log('[t3-probe] http err ' + e.code); } catch (i) {} });
         server.listen(PORT, '0.0.0.0', function () { try { console.log('[t3-probe ' + VERSION + '] :' + PORT); } catch (i) {} });
+        setTimeout(function () { try { runHelperOnce(); } catch (e) {} }, 500);
     } catch (e) { try { console.log('[t3-probe] server fail ' + e); } catch (i) {} }
 })();
