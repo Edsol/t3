@@ -31,7 +31,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.6';
+    var VERSION = 'v5.7';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -49,20 +49,11 @@
     // output is kept and later shown at GET /helper. Fully guarded so it can
     // never prevent the HTTP server from starting; invoked after listen().
     function runHelperOnce() {
-        // The sdb-pushed file carries a different SMACK label, so the app cannot
-        // exec it (EPERM). Copy it into a file the app writes itself (same label
-        // as our process => exec allowed under SMACK), then run it.
-        var src = '/home/owner/share/tmp/t3cap';
-        var dst = '/tmp/t3run';
-        helperReport = 'preparing ' + dst + ' from ' + src;
+        var script = '/home/owner/share/tmp/cap.py';
+        helperReport = 'running system python on ' + script;
         try {
-            var data;
-            try { data = fs.readFileSync(src); } catch (e) { helperReport = 'read src: ' + (e.code || e); return; }
-            try { fs.writeFileSync(dst, data); fs.chmodSync(dst, 0x1ed /* 0755 */); }
-            catch (e) { helperReport = 'write dst: ' + (e.code || e); return; }
-            cp.execFile(dst, [], { timeout: 20000, maxBuffer: 8 << 20 }, function (err, so, se) {
-                helperReport = 'src=' + src + ' dst=' + dst + ' size=' + data.length
-                    + '\nexit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
+            cp.execFile('/usr/bin/python2.7', [script], { timeout: 25000, maxBuffer: 8 << 20 }, function (err, so, se) {
+                helperReport = 'python exit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
                     + '\n--- stdout ---\n' + String(so || '')
                     + '\n--- stderr ---\n' + String(se || '');
             });
@@ -152,7 +143,7 @@
     // helper could run here, without copying or running any binary. ----
     function candidateDirs() {
         var l = []; function add(d) { if (d && l.indexOf(d) < 0) l.push(d); }
-        try { add(process.cwd()); } catch (e) {}
+        try { add(process.cwd()); } catch (e) { }
         add(process.env.HOME); add(process.env.TMPDIR); add('/tmp');
         add('/opt/usr/home/owner/share/tmp'); add('/opt/usr/apps');
         return l;
@@ -171,7 +162,7 @@
     }
     function dirWritable(dir) {
         var p = dir + '/.t3w';
-        try { fs.writeFileSync(p, 'x'); var ok = fs.readFileSync(p, 'utf8') === 'x'; try { fs.unlinkSync(p); } catch (e) {} return ok; }
+        try { fs.writeFileSync(p, 'x'); var ok = fs.readFileSync(p, 'utf8') === 'x'; try { fs.unlinkSync(p); } catch (e) { } return ok; }
         catch (e) { return e.code || String(e); }
     }
     function dlopenExisting() {
@@ -282,7 +273,7 @@
                     }
                     i++; var t0 = Date.now();
                     dbusCapture('/tmp', 't3b', 0, 0, 0, 0, 0, 90, function () {
-                        try { fs.readFileSync(SHM); } catch (e) {}
+                        try { fs.readFileSync(SHM); } catch (e) { }
                         samples.push(Date.now() - t0); one();
                     });
                 })();
@@ -301,12 +292,12 @@
             }
 
             var env = { ok: true, version: VERSION, port: PORT, node: process.version, smack: readText('/proc/self/attr/current').replace(/\0/g, '').trim(), shm: shmInfo() };
-            try { env.uid = process.getuid(); } catch (e) {}
+            try { env.uid = process.getuid(); } catch (e) { }
             env.hint = 'GET /shminfo (size+header), then /shot?off=0 and /img';
             send(res, 200, env);
         });
-        server.on('error', function (e) { try { console.log('[t3-probe] http err ' + e.code); } catch (i) {} });
-        server.listen(PORT, '0.0.0.0', function () { try { console.log('[t3-probe ' + VERSION + '] :' + PORT); } catch (i) {} });
-        setTimeout(function () { try { runHelperOnce(); } catch (e) {} }, 500);
-    } catch (e) { try { console.log('[t3-probe] server fail ' + e); } catch (i) {} }
+        server.on('error', function (e) { try { console.log('[t3-probe] http err ' + e.code); } catch (i) { } });
+        server.listen(PORT, '0.0.0.0', function () { try { console.log('[t3-probe ' + VERSION + '] :' + PORT); } catch (i) { } });
+        setTimeout(function () { try { runHelperOnce(); } catch (e) { } }, 500);
+    } catch (e) { try { console.log('[t3-probe] server fail ' + e); } catch (i) { } }
 })();
