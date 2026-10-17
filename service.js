@@ -31,7 +31,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.5';
+    var VERSION = 'v5.6';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -53,7 +53,7 @@
         // exec it (EPERM). Copy it into a file the app writes itself (same label
         // as our process => exec allowed under SMACK), then run it.
         var src = '/home/owner/share/tmp/t3cap';
-        var dst = (process.env.HOME || '/tmp') + '/t3run';
+        var dst = '/tmp/t3run';
         helperReport = 'preparing ' + dst + ' from ' + src;
         try {
             var data;
