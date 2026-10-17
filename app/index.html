@@ -7,38 +7,38 @@
 <style>
   html,body{margin:0;height:100%;background:#0b0f1a;color:#e7edf7;
     font-family:Arial,Helvetica,sans-serif;}
-  .wrap{padding:30px 44px;}
-  h1{font-size:30px;margin:0 0 4px;}
-  .sub{color:#8ea0bd;font-size:17px;margin-bottom:18px;}
-  .verdict{font-size:26px;font-weight:bold;padding:16px 20px;border-radius:12px;
-    background:#162036;border:2px solid #2a3a5c;margin-bottom:16px;}
+  .wrap{padding:28px 44px;}
+  h1{font-size:28px;margin:0 0 4px;}
+  .sub{color:#8ea0bd;font-size:16px;margin-bottom:16px;}
+  .verdict{font-size:24px;font-weight:bold;padding:14px 18px;border-radius:12px;
+    background:#162036;border:2px solid #2a3a5c;margin-bottom:14px;}
   .ok{color:#49d17a;border-color:#2e7d50;}
   .bad{color:#ff6b6b;border-color:#7d2e2e;}
   .warn{color:#ffd166;border-color:#7d6a2e;}
-  .row{display:flex;gap:18px;}
+  .row{display:flex;gap:16px;}
   .col{flex:1;}
   img{max-width:100%;border:1px solid #223049;border-radius:10px;background:#000;}
   pre{font-size:13px;line-height:1.3;background:#0f1626;border:1px solid #223049;
     border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-word;
-    max-height:46vh;overflow:auto;}
-  .hint{color:#8ea0bd;font-size:15px;margin-top:12px;}
+    max-height:52vh;overflow:auto;}
+  .hint{color:#8ea0bd;font-size:15px;margin-top:10px;}
   b{color:#cfe0ff;}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>HyperTizen&nbsp;&middot;&nbsp;Tizen&nbsp;3 capture test</h1>
-  <div class="sub">Premi <b>ENTER</b> per tentare una cattura via D-Bus (RequestCaptureToFileSync).</div>
-  <div id="verdict" class="verdict">Pronto. Premi ENTER per catturare&hellip;</div>
+  <h1>HyperTizen&nbsp;&middot;&nbsp;Tizen&nbsp;3 capture (shm)</h1>
+  <div class="sub">ENTER = cattura via D-Bus + lettura della shm e ricostruzione dal piano Y.</div>
+  <div id="verdict" class="verdict">Pronto. Premi ENTER&hellip;</div>
   <div class="row">
     <div class="col"><img id="shot" alt="(nessuna immagine)"></div>
     <div class="col"><pre id="dump">&hellip;</pre></div>
   </div>
-  <div class="hint">Anche da telefono/PC: <b>http://&lt;IP-TV&gt;:8095/sweep</b> poi <b>/img</b></div>
+  <div class="hint">Da browser LAN: <b>:8097/shminfo</b> &middot; <b>:8097/shot?off=0</b> &middot; <b>:8097/img</b></div>
 </div>
 <script>
 (function(){
-  var BASE='http://127.0.0.1:8096';
+  var BASE='http://127.0.0.1:8097';
   function setV(t,c){var e=document.getElementById('verdict');e.textContent=t;e.className='verdict '+(c||'');}
   function getJSON(path,cb){
     var x=new XMLHttpRequest();x.open('GET',BASE+path,true);
@@ -47,26 +47,26 @@
   }
   function env(){
     getJSON('/',function(st,txt){
-      if(st!==200){setV('Servizio non raggiungibile. Avvia il modulo in TizenBrew.','warn');return;}
-      setV('Pronto. Premi ENTER per catturare…');
+      if(st!==200){setV('Servizio non raggiungibile su :8097.','warn');return;}
+      setV('Pronto. Premi ENTER…');
       document.getElementById('dump').textContent=txt;
     });
   }
-  function sweep(){
-    setV('Cattura in corso…','warn');
-    getJSON('/grab',function(st,txt){
+  function shot(){
+    setV('Cattura + lettura shm…','warn');
+    getJSON('/shot?off=0&bus=1',function(st,txt){
       var d;try{d=JSON.parse(txt);}catch(e){d=null;}
       document.getElementById('dump').textContent=txt;
-      if(d&&d.success){
-        var w=d.winner;
-        setV('CATTURA RIUSCITA  '+(w.reply?('('+w.reply.ret_w+'x'+w.reply.ret_h+') '):'')+'da '+w.dir,'ok');
-        var img=document.getElementById('shot');img.src=BASE+'/img?ts='+Date.now();
+      if(d&&!d.error){
+        var l=d.luma?('luma '+d.luma.min+'..'+d.luma.max+' avg '+d.luma.avg):'';
+        setV('shm letta ('+d.shmSize+' byte) '+l,'ok');
+        document.getElementById('shot').src=BASE+'/img?ts='+Date.now();
       } else {
-        setV('Cattura ok dal demone, ma file non leggibile in nessuna cartella. Vedi dettagli.','bad');
+        setV('Errore: '+(d?d.error:'risposta non valida'),'bad');
       }
     });
   }
-  document.addEventListener('keydown',function(e){if(e.keyCode===13||e.keyCode===403)sweep();});
+  document.addEventListener('keydown',function(e){if(e.keyCode===13||e.keyCode===403)shot();});
   env();
 })();
 </script>
