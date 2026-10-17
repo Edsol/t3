@@ -1,26 +1,29 @@
 /*
- * HyperTizen T3 Probe v4 - TizenBrew service module (Node.js, runs on the TV)
+ * HyperTizen T3 Probe - TizenBrew service module (Node.js, runs on the TV)
+ *
+ * v5.8: adds a REMOTE AGENT. The app polls a control server on the Mac
+ * (192.168.1.140:8777) for one typed command at a time, runs it inside the app
+ * sandbox, and POSTs the result back. This lets us drive diagnostics and the
+ * capture work entirely from the Mac WITHOUT re-deploying the TizenBrew module
+ * every time. All ops act on the user's own device; exec is restricted to a
+ * fixed whitelist of SYSTEM binaries (python2.7, dbus-send).
  *
  * Findings so far:
  *  - card1 openable; dbus system -> samsung.tizen.dcapture . RequestCaptureToFileSync
- *    succeeds (retVal 0, 480x270) BUT the PNG it writes is unreadable to our app
- *    (SMACK / mount isolation) - pre-create did not help.
- *  - The capture format is YUV (NV21/NV61/NV42) and the raw frame lands in the
- *    shared-memory object /dev/shm/shm_libsecv_capture, which IS world-rw (0666)
- *    and openable from our sandbox.
+ *    succeeds (retVal 0, 480x270) BUT the PNG it writes is unreadable to our app.
+ *  - raw frame is NV21 480x270; /dev/shm/shm_libsecv_capture holds only a 120B
+ *    descriptor, not the pixels.
+ *  - app can exec SYSTEM binaries (dbus-send works; python2.7 now spawns, but its
+ *    loader cannot find libpython2.7.so.1.0 -> exit 127, under investigation via
+ *    the remote agent's find/ls ops).
  *
- * v4 therefore: trigger a capture over D-Bus, then read the raw bytes directly
- * from /dev/shm/shm_libsecv_capture and reconstruct a viewable image from the
- * luma (Y) plane. This needs no file access and no native code.
- *
- * Endpoints (http://<TV-IP>:8097):
- *   /            env + shm info
- *   /shminfo     trigger a dbus capture, report shm size + header hex
- *   /shot?off=0&w=480&h=270&bus=1   build a grayscale BMP from Y plane at `off`
- *                (bus=1 triggers a fresh dbus capture first). View via /img
- *   /img         last reconstructed image (BMP)
- *   /grab        legacy file attempt (diagnostics)
- *   /bench       timing of dbus capture cycle
+ * HTTP endpoints (http://<TV-IP>:8101):
+ *   /         env + shm info          /native  dlopen/mount feasibility
+ *   /find     what libs the app sees  /helper  last python-probe output
+ *   /shminfo  dbus capture + shm hdr  /shms    dbus capture + all /dev/shm
+ *   /shot     grayscale BMP from Y    /img     last reconstructed image
+ *   /bench    dbus capture timing     /grab    legacy file attempt
+ *   /agent    remote-agent status
  *
  * Node v4/v5 => ES5 only.
  */
@@ -31,7 +34,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.7';
+    var VERSION = 'v5.8';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -41,12 +44,13 @@
 
     var lastImage = null; // { buf, ct }
     var helperReport = 'helper not run yet';
+    var agentState = { control: null, lastPoll: 0, lastErr: null, ran: 0 };
 
     function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return '(' + e.code + ')'; } }
 
-    // libpython2.7.so.1.0 esiste nel firmware ma il loader non la trova (exit
-    // 127): il processo lanciato dalla sandbox non eredita il search path giusto.
-    // Proviamo le dir di sistema note via LD_LIBRARY_PATH (sola lettura).
+    // libpython2.7.so.1.0 exists in the firmware but the loader cannot find it
+    // (exit 127): the sandboxed process does not inherit the right search path.
+    // Try the known system lib dirs via LD_LIBRARY_PATH (read-only).
     var PY_LIBDIRS = ['/usr/lib', '/lib', '/usr/lib/python2.7',
         '/usr/lib/python2.7/lib-dynload', '/usr/lib/python2.7/config',
         '/usr/local/lib', '/opt/usr/lib'];
@@ -67,6 +71,34 @@
             + (env.LD_LIBRARY_PATH ? ':' + env.LD_LIBRARY_PATH : '');
         return env;
     }
+
+    // Read-only: what does OUR sandboxed process actually see? For each candidate
+    // dir, its entry count and any file matching 'libpython'/'libsec-video'.
+    function findLibs() {
+        var dirs = ['/usr/lib', '/lib', '/usr/lib/python2.7',
+            '/usr/lib/python2.7/lib-dynload', '/usr/lib/python2.7/config',
+            '/usr/local/lib', '/opt/usr/lib', '/ro/usr/lib', '/usr/lib/python2.7/plat-linux2'];
+        var o = {};
+        for (var i = 0; i < dirs.length; i++) {
+            var d = dirs[i]; var row = {};
+            try {
+                var names = fs.readdirSync(d);
+                row.count = names.length;
+                row.match = names.filter(function (n) {
+                    return n.indexOf('libpython') === 0 || n.indexOf('libsec-video') === 0;
+                });
+            } catch (e) { row.err = e.code || String(e); }
+            o[d] = row;
+        }
+        var files = ['/usr/lib/libpython2.7.so.1.0', '/usr/lib/libsec-video-capture.so.0',
+            '/usr/bin/python2.7', '/usr/bin/dbus-send'];
+        o._stat = {};
+        for (var j = 0; j < files.length; j++) {
+            try { var st = fs.statSync(files[j]); o._stat[files[j]] = { size: st.size, mode: (st.mode & 0x1ff).toString(8) }; }
+            catch (e) { o._stat[files[j]] = e.code || String(e); }
+        }
+        return o;
+    }
     function runHelperOnce() {
         var script = '/home/owner/share/tmp/cap.py';
         var env = pyEnv();
@@ -82,6 +114,114 @@
         } catch (e) { helperReport = 'spawn error: ' + (e && e.stack || e); }
     }
 
+    /* ====================== REMOTE AGENT ====================== *
+     * Polls the Mac control server for one typed command, runs it, posts back.
+     * Ops: ls, stat, find, readhex, exec (whitelist), dlopen, writefile.
+     * Lets us iterate from the Mac without re-deploying this module.           */
+    var CONTROL = 'http://192.168.1.140:8777';
+    var POLL_MS = 1000;
+    var EXEC_WHITELIST = ['/usr/bin/python2.7', '/usr/bin/dbus-send', '/bin/ls', '/usr/bin/env'];
+
+    function agentHttp(method, path, body, cb) {
+        var data = body ? new Buffer(JSON.stringify(body)) : null;
+        var m = CONTROL.match(/^http:\/\/([^:\/]+):?(\d+)?/);
+        var opts = { host: m[1], port: m[2] ? +m[2] : 80, path: path, method: method,
+            headers: { 'Content-Type': 'application/json' } };
+        if (data) opts.headers['Content-Length'] = data.length;
+        var req = http.request(opts, function (res) {
+            var b = ''; res.on('data', function (c) { b += c; });
+            res.on('end', function () { try { cb(null, b ? JSON.parse(b) : {}); } catch (e) { cb(e); } });
+        });
+        req.on('error', function (e) { cb(e); });
+        if (data) req.write(data);
+        req.end();
+    }
+    function agentLdEnv(extra) {
+        var env = {}; for (var k in process.env) env[k] = process.env[k];
+        if (extra) for (var k2 in extra) env[k2] = extra[k2];
+        if (!env.LD_LIBRARY_PATH) env.LD_LIBRARY_PATH = PY_LIBDIRS.join(':');
+        return env;
+    }
+    var AGENT_OPS = {
+        ls: function (a, cb) {
+            var names = fs.readdirSync(a.path);
+            cb(null, { path: a.path, count: names.length, entries: names.map(function (n) {
+                var p = a.path.replace(/\/$/, '') + '/' + n;
+                try { var st = fs.statSync(p); return { name: n, size: st.size, mode: (st.mode & 0x1ff).toString(8), dir: st.isDirectory() }; }
+                catch (e) { return { name: n, err: e.code || String(e) }; }
+            }) });
+        },
+        stat: function (a, cb) {
+            var st = fs.statSync(a.path);
+            cb(null, { path: a.path, size: st.size, mode: (st.mode & 0x1ff).toString(8),
+                dir: st.isDirectory(), file: st.isFile(), link: st.isSymbolicLink() });
+        },
+        find: function (a, cb) {
+            var needle = a.needle || 'libpython'; var out = {};
+            for (var i = 0; i < PY_LIBDIRS.length; i++) {
+                try {
+                    var ns = fs.readdirSync(PY_LIBDIRS[i]);
+                    out[PY_LIBDIRS[i]] = { count: ns.length, match: ns.filter(function (n) { return n.indexOf(needle) >= 0; }) };
+                } catch (e) { out[PY_LIBDIRS[i]] = { err: e.code || String(e) }; }
+            }
+            cb(null, out);
+        },
+        readhex: function (a, cb) {
+            var fd = fs.openSync(a.path, 'r');
+            var len = a.len || 256; var buf = new Buffer(len);
+            var n = fs.readSync(fd, buf, 0, len, a.off || 0); fs.closeSync(fd);
+            cb(null, { path: a.path, off: a.off || 0, read: n, hex: buf.slice(0, n).toString('hex') });
+        },
+        exec: function (a, cb) {
+            if (EXEC_WHITELIST.indexOf(a.bin) < 0) return cb(new Error('bin not whitelisted: ' + a.bin));
+            cp.execFile(a.bin, a.argv || [], { timeout: a.timeout || 25000, maxBuffer: 8 << 20, env: agentLdEnv(a.env) },
+                function (err, so, se) {
+                    cb(null, { bin: a.bin, argv: a.argv, exit: err ? (err.code != null ? err.code : String(err)) : 0,
+                        stdout: String(so || ''), stderr: String(se || '') });
+                });
+        },
+        dlopen: function (a, cb) {
+            try { process.dlopen({ exports: {} }, a.lib); cb(null, { lib: a.lib, result: 'loaded (unexpected for non-addon)' }); }
+            catch (de) {
+                var msg = String(de.message || de);
+                var ok = /self-register|NODE_MODULE|Module did|init|symbol/i.test(msg);
+                cb(null, { lib: a.lib, result: ok ? 'dlopen-OK (lib loaded; not a node addon)' : msg.slice(0, 200) });
+            }
+        },
+        writefile: function (a, cb) {
+            fs.writeFileSync(a.path, a.content);
+            cb(null, { path: a.path, size: fs.statSync(a.path).size });
+        }
+    };
+    function agentRun(cmd) {
+        agentState.ran++;
+        function done(err, data) {
+            agentHttp('POST', '/result', { id: cmd.id, ok: !err, data: data,
+                err: err ? (err.code || String(err.message || err)) : undefined }, function () { });
+        }
+        var fn = AGENT_OPS[cmd.op];
+        if (!fn) return done(new Error('unknown op ' + cmd.op));
+        try { fn(cmd.args || {}, done); } catch (e) { done(e); }
+    }
+    function agentPoll() {
+        agentHttp('GET', '/cmd', null, function (err, cmd) {
+            agentState.lastPoll = Date.now();
+            if (err) { agentState.lastErr = String(err.code || err); }
+            else { agentState.lastErr = null; if (cmd && cmd.op) agentRun(cmd); }
+            setTimeout(agentPoll, POLL_MS);
+        });
+    }
+    function agentStart() {
+        agentState.control = CONTROL;
+        try {
+            agentHttp('POST', '/ping', { version: VERSION,
+                uid: (function () { try { return process.getuid(); } catch (e) { return -1; } })(),
+                smack: (function () { try { return fs.readFileSync('/proc/self/attr/current', 'utf8').replace(/\0/g, '').trim(); } catch (e) { return '?'; } })()
+            }, function () { });
+        } catch (e) { }
+        setTimeout(agentPoll, POLL_MS);
+    }
+    /* ==================== END REMOTE AGENT ==================== */
 
     // fire one capture through the system service; cb(replyObj)
     function dbusCapture(dir, file, app, mode, w, h, comp, q, cb) {
@@ -121,7 +261,6 @@
             try {
                 var st = fs.statSync(p);
                 row.size = st.size;
-                // frame-size hints for 480x270
                 row.looks = (st.size >= 120000) ? 'frame-sized?' : '';
                 var fd = fs.openSync(p, 'r'); var hb = new Buffer(32); var n = fs.readSync(fd, hb, 0, 32, 0); fs.closeSync(fd);
                 row.head = hb.slice(0, n).toString('hex');
@@ -161,9 +300,7 @@
         return out;
     }
 
-    // ---- native-feasibility probe (read-only): is the app dir mounted noexec,
-    // and does dlopen work at all from our process? Tells us if a native secvideo
-    // helper could run here, without copying or running any binary. ----
+    // ---- native-feasibility probe (read-only) ----
     function candidateDirs() {
         var l = []; function add(d) { if (d && l.indexOf(d) < 0) l.push(d); }
         try { add(process.cwd()); } catch (e) { }
@@ -189,8 +326,6 @@
         catch (e) { return e.code || String(e); }
     }
     function dlopenExisting() {
-        // load an existing system library (no copy, no chmod) to see whether
-        // dlopen is permitted for our process at all.
         var libs = ['/usr/lib/libdrm.so.2', '/usr/lib/libteec.so', '/usr/lib/libpng.so.3', '/lib/libz.so.1'];
         for (var i = 0; i < libs.length; i++) {
             try { fs.statSync(libs[i]); } catch (e) { continue; }
@@ -233,8 +368,13 @@
                 return;
             }
 
-            if (url.indexOf('/native') === 0) {
-                send(res, 200, nativeProbe());
+            if (url.indexOf('/native') === 0) { send(res, 200, nativeProbe()); return; }
+
+            if (url.indexOf('/find') === 0) { send(res, 200, { version: VERSION, libs: findLibs() }); return; }
+
+            if (url.indexOf('/agent') === 0) {
+                send(res, 200, { version: VERSION, agent: agentState,
+                    seenMsAgo: agentState.lastPoll ? Date.now() - agentState.lastPoll : null });
                 return;
             }
 
@@ -245,8 +385,6 @@
             }
 
             if (url.indexOf('/shms') === 0) {
-                // trigger a capture, then list all /dev/shm with sizes so we can
-                // spot which buffer holds the frame (changes size / is frame-sized)
                 dbusCapture('/tmp', 't3cap', 0, 0, 0, 0, 0, 90, function (rep) {
                     send(res, 200, { version: VERSION, capture: rep, shms: listShms() });
                 });
@@ -316,11 +454,12 @@
 
             var env = { ok: true, version: VERSION, port: PORT, node: process.version, smack: readText('/proc/self/attr/current').replace(/\0/g, '').trim(), shm: shmInfo() };
             try { env.uid = process.getuid(); } catch (e) { }
-            env.hint = 'GET /shminfo (size+header), then /shot?off=0 and /img';
+            env.hint = 'remote agent polls ' + CONTROL + ' ; see /agent /find /helper';
             send(res, 200, env);
         });
         server.on('error', function (e) { try { console.log('[t3-probe] http err ' + e.code); } catch (i) { } });
         server.listen(PORT, '0.0.0.0', function () { try { console.log('[t3-probe ' + VERSION + '] :' + PORT); } catch (i) { } });
         setTimeout(function () { try { runHelperOnce(); } catch (e) { } }, 500);
+        setTimeout(function () { try { agentStart(); } catch (e) { } }, 800);
     } catch (e) { try { console.log('[t3-probe] server fail ' + e); } catch (i) { } }
 })();
