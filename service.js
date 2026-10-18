@@ -34,7 +34,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.8';
+    var VERSION = 'v5.9';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -119,7 +119,7 @@
      * Ops: ls, stat, find, readhex, exec (whitelist), dlopen, writefile.
      * Lets us iterate from the Mac without re-deploying this module.           */
     var CONTROL = 'http://192.168.1.140:8777';
-    var POLL_MS = 1000;
+    var POLL_MS = 250;
     var EXEC_WHITELIST = ['/usr/bin/python2.7', '/usr/bin/dbus-send', '/bin/ls', '/usr/bin/env'];
 
     function agentHttp(method, path, body, cb) {
@@ -201,6 +201,26 @@
         writefile: function (a, cb) {
             fs.writeFileSync(a.path, a.content);
             cb(null, { path: a.path, size: fs.statSync(a.path).size });
+        },
+        // One round-trip capture: trigger a dbus screen capture into /dev/shm,
+        // read the resulting JPEG, and return its bytes as hex. Collapses the
+        // old 3-call cycle (exec+stat+readhex) into a single agent reply, which
+        // removes 2 poll-interval waits per frame -> much higher ambilight fps.
+        grab: function (a, cb) {
+            var q = (a && a.q) || 60;
+            var dir = '/dev/shm';
+            var file = 't3grab';
+            var path = dir + '/' + file + '.jpg';
+            var args = ['--system', '--print-reply', '--reply-timeout=4000', '--type=method_call',
+                '--dest=' + NAME, OBJ, METHOD,
+                'int32:0', 'int32:0', 'int32:1', 'int32:480', 'int32:270', 'int32:' + q,
+                'string:' + dir, 'string:' + file];
+            cp.execFile(DBUS, args, { timeout: 6000, maxBuffer: 1 << 20 }, function (err) {
+                try {
+                    var buf = fs.readFileSync(path);
+                    cb(null, { path: path, size: buf.length, hex: buf.toString('hex') });
+                } catch (e) { cb(e); }
+            });
         }
     };
     function agentRun(cmd) {
