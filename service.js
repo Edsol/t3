@@ -1,6 +1,11 @@
 /*
  * HyperTizen T3 Probe - TizenBrew service module (Node.js, runs on the TV)
  *
+ * v6.0: FRAME STREAM. The app captures the screen continuously (JPEG via dbus
+ * into /dev/shm) and POSTs each frame to CONTROL/frame on the host
+ * (host/t3_ambilight.py), which drives the LEDs. The agent below stays as a
+ * debug channel on the same host.
+ *
  * v5.8: adds a REMOTE AGENT. The app polls a control server on the Mac
  * (192.168.1.140:8777) for one typed command at a time, runs it inside the app
  * sandbox, and POSTs the result back. This lets us drive diagnostics and the
@@ -34,7 +39,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v5.9';
+    var VERSION = 'v6.0';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -118,7 +123,7 @@
      * Polls the Mac control server for one typed command, runs it, posts back.
      * Ops: ls, stat, find, readhex, exec (whitelist), dlopen, writefile.
      * Lets us iterate from the Mac without re-deploying this module.           */
-    var CONTROL = 'http://192.168.1.140:8777';
+    var CONTROL = 'http://192.168.1.60:8777';
     var POLL_MS = 250;
     var EXEC_WHITELIST = ['/usr/bin/python2.7', '/usr/bin/dbus-send', '/bin/ls', '/usr/bin/env'];
 
@@ -252,6 +257,51 @@
         setTimeout(agentPoll, POLL_MS);
     }
     /* ==================== END REMOTE AGENT ==================== */
+
+    /* ==================== FRAME STREAM (v6.0) ====================
+     * Push mode: the TV captures continuously and POSTs each JPEG to
+     * CONTROL/frame. No per-frame command round-trip, so the rate is bound
+     * only by the capture itself (~5-9 fps). The server's JSON reply steers
+     * the loop ({on, q, w, h, gap}), so it can be tuned or paused remotely.
+     * While paused, an empty POST every 2s keeps asking for new params.   */
+    var STREAM_FILE = 't3stream';
+    var stream = { on: true, q: 55, w: 480, h: 270, gap: 0, frames: 0, lastErr: null, lastMs: 0 };
+
+    function streamPost(buf, cb) {
+        var m = CONTROL.match(/^http:\/\/([^:\/]+):?(\d+)?/);
+        var req = http.request({ host: m[1], port: m[2] ? +m[2] : 80, path: '/frame', method: 'POST',
+            headers: { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length } }, function (res) {
+            var b = ''; res.on('data', function (c) { b += c; });
+            res.on('end', function () { try { cb(null, b ? JSON.parse(b) : {}); } catch (e) { cb(e); } });
+        });
+        req.setTimeout(5000, function () { req.abort(); });
+        req.on('error', function (e) { cb(e); });
+        req.write(buf);
+        req.end();
+    }
+    function streamNext(err, cfg) {
+        if (err) { stream.lastErr = String(err.code || err.message || err); return setTimeout(streamLoop, 2000); }
+        stream.lastErr = null;
+        if (cfg) for (var k in cfg) if (k in stream && k !== 'frames') stream[k] = cfg[k];
+        setTimeout(streamLoop, stream.on ? (stream.gap || 0) : 2000);
+    }
+    function streamLoop() {
+        if (!stream.on) return streamPost(new Buffer(0), streamNext);
+        var t0 = Date.now();
+        var args = ['--system', '--print-reply', '--reply-timeout=4000', '--type=method_call',
+            '--dest=' + NAME, OBJ, METHOD,
+            'int32:0', 'int32:0', 'int32:1', 'int32:' + stream.w, 'int32:' + stream.h, 'int32:' + stream.q,
+            'string:/dev/shm', 'string:' + STREAM_FILE];
+        cp.execFile(DBUS, args, { timeout: 6000, maxBuffer: 1 << 20 }, function () {
+            var buf;
+            try { buf = fs.readFileSync('/dev/shm/' + STREAM_FILE + '.jpg'); }
+            catch (e) { return streamNext(e); }
+            streamPost(buf, function (e, cfg) {
+                if (!e) { stream.frames++; stream.lastMs = Date.now() - t0; }
+                streamNext(e, cfg);
+            });
+        });
+    }
 
     // fire one capture through the system service; cb(replyObj)
     function dbusCapture(dir, file, app, mode, w, h, comp, q, cb) {
@@ -403,7 +453,7 @@
             if (url.indexOf('/find') === 0) { send(res, 200, { version: VERSION, libs: findLibs() }); return; }
 
             if (url.indexOf('/agent') === 0) {
-                send(res, 200, { version: VERSION, agent: agentState,
+                send(res, 200, { version: VERSION, agent: agentState, stream: stream,
                     seenMsAgo: agentState.lastPoll ? Date.now() - agentState.lastPoll : null });
                 return;
             }
@@ -491,5 +541,6 @@
         server.listen(PORT, '0.0.0.0', function () { try { console.log('[t3-probe ' + VERSION + '] :' + PORT); } catch (i) { } });
         setTimeout(function () { try { runHelperOnce(); } catch (e) { } }, 500);
         setTimeout(function () { try { agentStart(); } catch (e) { } }, 800);
+        setTimeout(function () { try { streamLoop(); } catch (e) { } }, 1200);
     } catch (e) { try { console.log('[t3-probe] server fail ' + e); } catch (i) { } }
 })();

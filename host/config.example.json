@@ -1,0 +1,21 @@
+{
+  "port": 8777,
+  "tuya": {
+    "id": "<device id>",
+    "key": "<local key>",
+    "ip": "192.168.1.88",
+    "version": "3.5"
+  },
+  "dp": "61",
+  "count": 20,
+  "per_module": 5,
+  "module_zones": ["right", "top-right", "top-left", "left"],
+  "reverse": false,
+  "sat_boost": 1.7,
+  "smooth": 0.15,
+  "gamma": 2.2,
+  "min_v": 0.12,
+  "black_luma": 6.0,
+  "idle_disconnect_s": 10,
+  "stream": { "on": true, "q": 55, "w": 480, "h": 270, "gap": 0 }
+}
