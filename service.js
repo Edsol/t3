@@ -1,17 +1,20 @@
 /*
  * HyperTizen T3 Probe - TizenBrew service module (Node.js, runs on the TV)
  *
- * v6.0: FRAME STREAM. The app captures the screen continuously (JPEG via dbus
- * into /dev/shm) and POSTs each frame to CONTROL/frame on the host
- * (host/t3_ambilight.py), which drives the LEDs. The agent below stays as a
- * debug channel on the same host.
+ * v6.2: NO SERVER ADDRESS IN CODE. The host is found by LAN discovery (UDP
+ * 8778) or pinned via GET /config?control=<url> / the agent 'config' op; the
+ * choice is saved on the TV (see SERVER CONFIG + DISCOVERY below).
  *
- * v5.8: adds a REMOTE AGENT. The app polls a control server on the Mac
- * (192.168.1.140:8777) for one typed command at a time, runs it inside the app
- * sandbox, and POSTs the result back. This lets us drive diagnostics and the
- * capture work entirely from the Mac WITHOUT re-deploying the TizenBrew module
- * every time. All ops act on the user's own device; exec is restricted to a
- * fixed whitelist of SYSTEM binaries (python2.7, dbus-send).
+ * v6.0: FRAME STREAM. The app captures the screen continuously (JPEG via dbus
+ * into /dev/shm) and POSTs each frame to <server>/frame on the host
+ * (host/t3_ambilight.py), which forwards it to HyperHDR (or drives the LEDs
+ * itself). The agent below stays as a debug channel on the same host.
+ *
+ * v5.8: adds a REMOTE AGENT. The app polls the host for one typed command at
+ * a time, runs it inside the app sandbox, and POSTs the result back. This lets
+ * us drive diagnostics and the capture work WITHOUT re-deploying the TizenBrew
+ * module every time. All ops act on the user's own device; exec is restricted
+ * to a fixed whitelist of SYSTEM binaries (python2.7, dbus-send).
  *
  * Findings so far:
  *  - card1 openable; dbus system -> samsung.tizen.dcapture . RequestCaptureToFileSync
@@ -28,7 +31,7 @@
  *   /shminfo  dbus capture + shm hdr  /shms    dbus capture + all /dev/shm
  *   /shot     grayscale BMP from Y    /img     last reconstructed image
  *   /bench    dbus capture timing     /grab    legacy file attempt
- *   /agent    remote-agent status
+ *   /agent    remote-agent status     /config  server address (get/pin/reset)
  *
  * Node v4/v5 => ES5 only.
  */
@@ -39,7 +42,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v6.1';
+    var VERSION = 'v6.2';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -119,23 +122,93 @@
         } catch (e) { helperReport = 'spawn error: ' + (e && e.stack || e); }
     }
 
+    /* ============== SERVER CONFIG + DISCOVERY (v6.2) ==============
+     * No server address in the code. The host URL (host/t3_ambilight.py) comes
+     * from, in order:
+     *  1. a config file saved on the TV, set via GET /config?control=<url> on
+     *     this module's HTTP server or by the host through the agent 'config' op;
+     *  2. LAN discovery: the TV broadcasts "T3-DISCOVER" on UDP 8778 and listens
+     *     there for the host's replies/periodic beacons {"t3":1,"control":url}.
+     * A discovered server that stops answering for 30s is looked up again.    */
+    var CONFIG_DIR = '/opt/usr/home/owner/share/tmp/t3';
+    var CONFIG_FILE = CONFIG_DIR + '/config.json';
+    var DISCOVERY_PORT = 8778;
+    var upstream = { control: null, source: 'none', lastOk: 0, lastBeacon: 0, discoErr: null };
+    var discoveryProbe = null;   // set by discoveryStart(): broadcast a lookup now
+
+    function parseUrl(u) {
+        var m = /^http:\/\/([^:\/]+):?(\d+)?/.exec(u || '');
+        return m ? { host: m[1], port: m[2] ? +m[2] : 80 } : null;
+    }
+    function loadConfig() {
+        try {
+            var c = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+            if (parseUrl(c.control)) { upstream.control = c.control; upstream.source = 'file'; }
+        } catch (e) { }
+    }
+    // control = url -> pin this server (persisted); control = null -> back to discovery
+    function saveConfig(control) {
+        if (control) {
+            if (!parseUrl(control)) throw new Error('bad url: ' + control);
+            try { fs.mkdirSync(CONFIG_DIR); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+            fs.writeFileSync(CONFIG_FILE, JSON.stringify({ control: control }));
+            upstream.control = control; upstream.source = 'file';
+        } else {
+            try { fs.unlinkSync(CONFIG_FILE); } catch (e) { }
+            upstream.control = null; upstream.source = 'none';
+            if (discoveryProbe) discoveryProbe();
+        }
+    }
+    function discoveryStart() {
+        var dgram = require('dgram'), sock;
+        try { sock = dgram.createSocket({ type: 'udp4', reuseAddr: true }); }
+        catch (e) { upstream.discoErr = String(e.message || e); return; }
+        sock.on('error', function (e) { upstream.discoErr = String(e.code || e.message || e); });
+        sock.on('message', function (msg) {
+            var m;
+            try { m = JSON.parse(msg.toString()); } catch (e) { return; }
+            if (!m || !m.t3 || !parseUrl(m.control)) return;
+            upstream.lastBeacon = Date.now();
+            if (upstream.source === 'file' || upstream.control === m.control) return;
+            upstream.control = m.control; upstream.source = 'discovery';
+        });
+        sock.bind(DISCOVERY_PORT, function () {
+            try { sock.setBroadcast(true); } catch (e) { upstream.discoErr = 'setBroadcast: ' + (e.message || e); }
+            discoveryProbe = function () {
+                var b = new Buffer('T3-DISCOVER');
+                sock.send(b, 0, b.length, DISCOVERY_PORT, '255.255.255.255', function (e) {
+                    if (e) upstream.discoErr = String(e.code || e.message || e);
+                });
+            };
+            (function loop() {
+                var stale = !upstream.control || Date.now() - upstream.lastOk > 30000;
+                if (upstream.source !== 'file' && stale) discoveryProbe();
+                setTimeout(loop, upstream.control ? 10000 : 3000);
+            })();
+        });
+    }
+    /* ============ END SERVER CONFIG + DISCOVERY ============ */
+
     /* ====================== REMOTE AGENT ====================== *
-     * Polls the Mac control server for one typed command, runs it, posts back.
-     * Ops: ls, stat, find, readhex, exec (whitelist), dlopen, writefile.
-     * Lets us iterate from the Mac without re-deploying this module.           */
-    var CONTROL = 'http://192.168.1.61:8777';
+     * Polls the host for one typed command, runs it, posts back.
+     * Ops: ls, stat, find, readhex, exec (whitelist), dlopen, writefile, grab, config.
+     * Lets us iterate from the host without re-deploying this module.        */
     var POLL_MS = 250;
     var EXEC_WHITELIST = ['/usr/bin/python2.7', '/usr/bin/dbus-send', '/bin/ls', '/usr/bin/env'];
 
     function agentHttp(method, path, body, cb) {
+        var u = parseUrl(upstream.control);
+        if (!u) return cb(new Error('no server yet'));
         var data = body ? new Buffer(JSON.stringify(body)) : null;
-        var m = CONTROL.match(/^http:\/\/([^:\/]+):?(\d+)?/);
-        var opts = { host: m[1], port: m[2] ? +m[2] : 80, path: path, method: method,
+        var opts = { host: u.host, port: u.port, path: path, method: method,
             headers: { 'Content-Type': 'application/json' } };
         if (data) opts.headers['Content-Length'] = data.length;
         var req = http.request(opts, function (res) {
             var b = ''; res.on('data', function (c) { b += c; });
-            res.on('end', function () { try { cb(null, b ? JSON.parse(b) : {}); } catch (e) { cb(e); } });
+            res.on('end', function () {
+                upstream.lastOk = Date.now();
+                try { cb(null, b ? JSON.parse(b) : {}); } catch (e) { cb(e); }
+            });
         });
         req.on('error', function (e) { cb(e); });
         if (data) req.write(data);
@@ -226,6 +299,12 @@
                     cb(null, { path: path, size: buf.length, hex: buf.toString('hex') });
                 } catch (e) { cb(e); }
             });
+        },
+        // Pin the TV to a server ({control: url}, persisted) or go back to
+        // discovery ({control: null}). Answered before the switch takes effect.
+        config: function (a, cb) {
+            saveConfig(a.control || null);
+            cb(null, { upstream: upstream, configFile: CONFIG_FILE });
         }
     };
     function agentRun(cmd) {
@@ -238,29 +317,32 @@
         if (!fn) return done(new Error('unknown op ' + cmd.op));
         try { fn(cmd.args || {}, done); } catch (e) { done(e); }
     }
+    function agentPing() {
+        agentHttp('POST', '/ping', { version: VERSION,
+            uid: (function () { try { return process.getuid(); } catch (e) { return -1; } })(),
+            smack: (function () { try { return fs.readFileSync('/proc/self/attr/current', 'utf8').replace(/\0/g, '').trim(); } catch (e) { return '?'; } })()
+        }, function () { });
+    }
     function agentPoll() {
+        if (agentState.control !== upstream.control) {   // new/changed server: say hello
+            agentState.control = upstream.control;
+            if (upstream.control) agentPing();
+        }
         agentHttp('GET', '/cmd', null, function (err, cmd) {
             agentState.lastPoll = Date.now();
-            if (err) { agentState.lastErr = String(err.code || err); }
+            if (err) { agentState.lastErr = String(err.code || err.message || err); }
             else { agentState.lastErr = null; if (cmd && cmd.op) agentRun(cmd); }
-            setTimeout(agentPoll, POLL_MS);
+            setTimeout(agentPoll, err ? 2000 : POLL_MS);
         });
     }
     function agentStart() {
-        agentState.control = CONTROL;
-        try {
-            agentHttp('POST', '/ping', { version: VERSION,
-                uid: (function () { try { return process.getuid(); } catch (e) { return -1; } })(),
-                smack: (function () { try { return fs.readFileSync('/proc/self/attr/current', 'utf8').replace(/\0/g, '').trim(); } catch (e) { return '?'; } })()
-            }, function () { });
-        } catch (e) { }
         setTimeout(agentPoll, POLL_MS);
     }
     /* ==================== END REMOTE AGENT ==================== */
 
     /* ==================== FRAME STREAM (v6.0) ====================
      * Push mode: the TV captures continuously and POSTs each JPEG to
-     * CONTROL/frame. No per-frame command round-trip, so the rate is bound
+     * <server>/frame. No per-frame command round-trip, so the rate is bound
      * only by the capture itself (~5-9 fps). The server's JSON reply steers
      * the loop ({on, q, w, h, gap}), so it can be tuned or paused remotely.
      * While paused, an empty POST every 2s keeps asking for new params.   */
@@ -268,11 +350,15 @@
     var stream = { on: true, q: 55, w: 480, h: 270, gap: 0, frames: 0, lastErr: null, lastMs: 0 };
 
     function streamPost(buf, cb) {
-        var m = CONTROL.match(/^http:\/\/([^:\/]+):?(\d+)?/);
-        var req = http.request({ host: m[1], port: m[2] ? +m[2] : 80, path: '/frame', method: 'POST',
+        var u = parseUrl(upstream.control);
+        if (!u) return cb(new Error('no server yet'));
+        var req = http.request({ host: u.host, port: u.port, path: '/frame', method: 'POST',
             headers: { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length } }, function (res) {
             var b = ''; res.on('data', function (c) { b += c; });
-            res.on('end', function () { try { cb(null, b ? JSON.parse(b) : {}); } catch (e) { cb(e); } });
+            res.on('end', function () {
+                upstream.lastOk = Date.now();
+                try { cb(null, b ? JSON.parse(b) : {}); } catch (e) { cb(e); }
+            });
         });
         req.setTimeout(5000, function () { req.abort(); });
         req.on('error', function (e) { cb(e); });
@@ -286,6 +372,7 @@
         setTimeout(streamLoop, stream.on ? (stream.gap || 0) : 2000);
     }
     function streamLoop() {
+        if (!upstream.control) { stream.lastErr = 'no server yet'; return setTimeout(streamLoop, 2000); }
         if (!stream.on) return streamPost(new Buffer(0), streamNext);
         var t0 = Date.now();
         var args = ['--system', '--print-reply', '--reply-timeout=4000', '--type=method_call',
@@ -453,8 +540,21 @@
             if (url.indexOf('/find') === 0) { send(res, 200, { version: VERSION, libs: findLibs() }); return; }
 
             if (url.indexOf('/agent') === 0) {
-                send(res, 200, { version: VERSION, agent: agentState, stream: stream,
+                send(res, 200, { version: VERSION, upstream: upstream, agent: agentState, stream: stream,
                     seenMsAgo: agentState.lastPoll ? Date.now() - agentState.lastPoll : null });
+                return;
+            }
+
+            // /config                      -> current server + where it came from
+            // /config?control=http://h:p   -> pin that server (saved on the TV)
+            // /config?reset=1              -> forget it, use LAN discovery
+            if (url.indexOf('/config') === 0) {
+                var qc = parseQ(url);
+                try {
+                    if (qc.reset) saveConfig(null);
+                    else if (qc.control) saveConfig(qc.control);
+                } catch (e) { send(res, 400, { error: String(e.message || e) }); return; }
+                send(res, 200, { version: VERSION, upstream: upstream, configFile: CONFIG_FILE });
                 return;
             }
 
@@ -534,11 +634,14 @@
 
             var env = { ok: true, version: VERSION, port: PORT, node: process.version, smack: readText('/proc/self/attr/current').replace(/\0/g, '').trim(), shm: shmInfo() };
             try { env.uid = process.getuid(); } catch (e) { }
-            env.hint = 'remote agent polls ' + CONTROL + ' ; see /agent /find /helper';
+            env.upstream = upstream;
+            env.hint = 'see /config /agent /find /helper';
             send(res, 200, env);
         });
         server.on('error', function (e) { try { console.log('[t3-probe] http err ' + e.code); } catch (i) { } });
         server.listen(PORT, '0.0.0.0', function () { try { console.log('[t3-probe ' + VERSION + '] :' + PORT); } catch (i) { } });
+        try { loadConfig(); } catch (e) { }
+        try { discoveryStart(); } catch (e) { upstream.discoErr = String(e.message || e); }
         setTimeout(function () { try { runHelperOnce(); } catch (e) { } }, 500);
         setTimeout(function () { try { agentStart(); } catch (e) { } }, 800);
         setTimeout(function () { try { streamLoop(); } catch (e) { } }, 1200);

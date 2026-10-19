@@ -8,6 +8,11 @@
     "origin": "t3-tv",
     "duration_ms": 3000
   },
+  "discovery": {
+    "port": 8778,
+    "beacon_s": 5,
+    "advertise": null
+  },
   "tuya": {
     "id": "<device id>",
     "key": "<local key>",

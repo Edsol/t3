@@ -17,7 +17,12 @@ container). It does two jobs on one HTTP port (default 8777):
    The /frame reply steers the TV loop ({on, q, w, h, gap}), changeable at
    runtime via POST /stream.
 
-2. Agent relay (debug). Same API as the old control-server.js: the TV polls
+2. LAN discovery (UDP 8778), so the TV needs no server address: answers the
+   TV's "T3-DISCOVER" broadcast and sends a beacon every few seconds, both as
+   {"t3":1,"control":"http://<this host>:<port>"}. "discovery.advertise" overrides
+   the URL (e.g. behind NAT or with several interfaces).
+
+3. Agent relay (debug). Same API as the old control-server.js: the TV polls
    GET /cmd for one typed command and POSTs the outcome to /result; operators
    queue commands with POST /enqueue and read GET /result/<id>.
 
@@ -29,7 +34,7 @@ Endpoints:
 
 usage: t3_ambilight.py [--config config.json] [--port 8777]
 """
-import base64, colorsys, io, json, math, os, struct, sys, threading, time
+import base64, colorsys, io, json, math, os, socket, struct, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -73,6 +78,8 @@ HH = {"host": "127.0.0.1", "port": 19400, "priority": 150, "origin": "t3-tv", "d
 HH.update(CFG.get("hyperhdr", {}))
 STREAM = {"on": True, "q": 55, "w": 480, "h": 270, "gap": 0}
 STREAM.update(CFG.get("stream", {}))
+DISCO = {"port": 8778, "beacon_s": 5, "advertise": None}
+DISCO.update(CFG.get("discovery", {}))
 
 
 def log(*a):
@@ -398,6 +405,50 @@ def hyperhdr_worker():
             log("loop err:", e)
 
 
+# ---------------------------------------------------------------- discovery
+
+def own_url(peer=None):
+    """URL the TV should use to reach us: the address of the interface that
+    routes to the TV (or to the default route for broadcasts)."""
+    if DISCO.get("advertise"):
+        return DISCO["advertise"]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # UDP connect sends nothing; it only selects the outgoing interface.
+        # 192.0.2.1 is TEST-NET-1 (never routed), used just to pick the default route.
+        s.connect((peer or "192.0.2.1", 9))
+        return "http://%s:%d" % (s.getsockname()[0], PORT)
+    finally:
+        s.close()
+
+
+def discovery_worker():
+    port, every = int(DISCO["port"]), float(DISCO.get("beacon_s") or 0)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.bind(("", port))
+    s.settimeout(every or None)
+    log("discovery on udp %d, advertising %s" % (port, own_url()))
+    next_beacon = 0.0
+    while True:
+        if every and time.time() >= next_beacon:
+            try:
+                s.sendto(json.dumps({"t3": 1, "control": own_url()}).encode(), ("255.255.255.255", port))
+            except OSError as e:
+                stats["disco_err"] = str(e)
+            next_beacon = time.time() + every
+        try:
+            data, addr = s.recvfrom(512)
+        except socket.timeout:
+            continue
+        if data.strip() == b"T3-DISCOVER":
+            s.sendto(json.dumps({"t3": 1, "control": own_url(addr[0])}).encode(), addr)
+            if stats.get("discovered_by") != addr[0]:
+                log("discovery request from", addr[0])
+            stats["discovered_by"] = addr[0]
+
+
 # ---------------------------------------------------------------- agent relay
 
 relay_cv = threading.Condition()
@@ -508,6 +559,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     worker = hyperhdr_worker if OUTPUT == "hyperhdr" else led_worker
     threading.Thread(target=worker, daemon=True).start()
+    if DISCO.get("port"):
+        threading.Thread(target=discovery_worker, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     if OUTPUT == "hyperhdr":
