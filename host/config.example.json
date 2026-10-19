@@ -1,5 +1,13 @@
 {
   "port": 8777,
+  "output": "hyperhdr",
+  "hyperhdr": {
+    "host": "127.0.0.1",
+    "port": 19400,
+    "priority": 150,
+    "origin": "t3-tv",
+    "duration_ms": 3000
+  },
   "tuya": {
     "id": "<device id>",
     "key": "<local key>",
@@ -9,7 +17,12 @@
   "dp": "61",
   "count": 20,
   "per_module": 5,
-  "module_zones": ["right", "top-right", "top-left", "left"],
+  "module_zones": [
+    "right",
+    "top-right",
+    "top-left",
+    "left"
+  ],
   "reverse": false,
   "sat_boost": 1.7,
   "smooth": 0.15,
@@ -17,5 +30,15 @@
   "min_v": 0.12,
   "black_luma": 6.0,
   "idle_disconnect_s": 10,
-  "stream": { "on": true, "q": 55, "w": 480, "h": 270, "gap": 0 }
+  "tuya_nowait": false,
+  "tuya_max_hz": 12,
+  "fade_out_s": 0.6,
+  "fade_in_s": 0.25,
+  "stream": {
+    "on": true,
+    "q": 55,
+    "w": 480,
+    "h": 270,
+    "gap": 0
+  }
 }

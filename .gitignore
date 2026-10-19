@@ -1,3 +1,5 @@
 host/config.json
 tuya.json
 __pycache__/
+firmware-backup/
+tmp/*.DS_Store

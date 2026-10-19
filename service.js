@@ -39,7 +39,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v6.0';
+    var VERSION = 'v6.1';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -123,7 +123,7 @@
      * Polls the Mac control server for one typed command, runs it, posts back.
      * Ops: ls, stat, find, readhex, exec (whitelist), dlopen, writefile.
      * Lets us iterate from the Mac without re-deploying this module.           */
-    var CONTROL = 'http://192.168.1.60:8777';
+    var CONTROL = 'http://192.168.1.61:8777';
     var POLL_MS = 250;
     var EXEC_WHITELIST = ['/usr/bin/python2.7', '/usr/bin/dbus-send', '/bin/ls', '/usr/bin/env'];
 
