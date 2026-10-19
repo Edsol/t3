@@ -76,7 +76,7 @@ FADE_IN = float(CFG.get("fade_in_s", 0.25))
 # the TV stops streaming (TV off), instead of freezing on the last frame.
 HH = {"host": "127.0.0.1", "port": 19400, "priority": 150, "origin": "t3-tv", "duration_ms": 3000}
 HH.update(CFG.get("hyperhdr", {}))
-STREAM = {"on": True, "q": 55, "w": 480, "h": 270, "gap": 0}
+STREAM = {"on": True, "q": 55, "w": 480, "h": 270, "gap": 0, "par": 1}
 STREAM.update(CFG.get("stream", {}))
 DISCO = {"port": 8778, "beacon_s": 5, "advertise": None}
 DISCO.update(CFG.get("discovery", {}))

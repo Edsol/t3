@@ -42,7 +42,7 @@
     var http = require('http');
     var cp = require('child_process');
 
-    var VERSION = 'v6.2';
+    var VERSION = 'v6.3';
     var PORT = 8101;
     var DBUS = '/usr/bin/dbus-send';
     var NAME = 'samsung.tizen.dcapture';
@@ -343,12 +343,26 @@
     /* ==================== FRAME STREAM (v6.0) ====================
      * Push mode: the TV captures continuously and POSTs each JPEG to
      * <server>/frame. No per-frame command round-trip, so the rate is bound
-     * only by the capture itself (~5-9 fps). The server's JSON reply steers
-     * the loop ({on, q, w, h, gap}), so it can be tuned or paused remotely.
+     * only by the capture itself (~7-8 fps, independent of resolution: the
+     * cost is the dbus-send spawn + the daemon's capture). The server's JSON
+     * reply steers the loop ({on, q, w, h, gap, par}), so it can be tuned or
+     * paused remotely. 'par' runs that many capture workers side by side
+     * (own file each) to overlap the fixed per-capture cost (v6.3).
      * While paused, an empty POST every 2s keeps asking for new params.   */
     var STREAM_FILE = 't3stream';
-    var stream = { on: true, q: 55, w: 480, h: 270, gap: 0, frames: 0, lastErr: null, lastMs: 0 };
+    var MAX_PAR = 4;
+    var stream = { on: true, q: 55, w: 480, h: 270, gap: 0, par: 1, frames: 0, lastErr: null, lastMs: 0 };
+    var streamWorkers = {};
 
+    function streamPar() { return Math.max(1, Math.min(MAX_PAR, stream.par | 0)); }
+    function streamEnsureWorkers() {
+        for (var i = 0; i < streamPar(); i++) {
+            if (!streamWorkers[i]) {
+                streamWorkers[i] = true;
+                (function (n) { setTimeout(function () { streamLoop(n); }, n * 40); })(i);
+            }
+        }
+    }
     function streamPost(buf, cb) {
         var u = parseUrl(upstream.control);
         if (!u) return cb(new Error('no server yet'));
@@ -365,27 +379,33 @@
         req.write(buf);
         req.end();
     }
-    function streamNext(err, cfg) {
-        if (err) { stream.lastErr = String(err.code || err.message || err); return setTimeout(streamLoop, 2000); }
+    function streamNext(n, err, cfg) {
+        if (!err && cfg) for (var k in cfg) if (k in stream && k !== 'frames') stream[k] = cfg[k];
+        if (n >= streamPar()) { streamWorkers[n] = false; return; }   // par lowered: retire
+        streamEnsureWorkers();                                         // par raised: spawn
+        if (err) { stream.lastErr = String(err.code || err.message || err); return setTimeout(function () { streamLoop(n); }, 2000); }
         stream.lastErr = null;
-        if (cfg) for (var k in cfg) if (k in stream && k !== 'frames') stream[k] = cfg[k];
-        setTimeout(streamLoop, stream.on ? (stream.gap || 0) : 2000);
+        setTimeout(function () { streamLoop(n); }, stream.on ? (stream.gap || 0) : 2000);
     }
-    function streamLoop() {
-        if (!upstream.control) { stream.lastErr = 'no server yet'; return setTimeout(streamLoop, 2000); }
-        if (!stream.on) return streamPost(new Buffer(0), streamNext);
-        var t0 = Date.now();
+    function streamLoop(n) {
+        n = n || 0;
+        if (!upstream.control) { stream.lastErr = 'no server yet'; return setTimeout(function () { streamLoop(n); }, 2000); }
+        if (!stream.on) {
+            if (n > 0) { streamWorkers[n] = false; return; }   // one worker is enough to poll
+            return streamPost(new Buffer(0), function (e, cfg) { streamNext(n, e, cfg); });
+        }
+        var t0 = Date.now(), file = STREAM_FILE + n;
         var args = ['--system', '--print-reply', '--reply-timeout=4000', '--type=method_call',
             '--dest=' + NAME, OBJ, METHOD,
             'int32:0', 'int32:0', 'int32:1', 'int32:' + stream.w, 'int32:' + stream.h, 'int32:' + stream.q,
-            'string:/dev/shm', 'string:' + STREAM_FILE];
+            'string:/dev/shm', 'string:' + file];
         cp.execFile(DBUS, args, { timeout: 6000, maxBuffer: 1 << 20 }, function () {
             var buf;
-            try { buf = fs.readFileSync('/dev/shm/' + STREAM_FILE + '.jpg'); }
-            catch (e) { return streamNext(e); }
+            try { buf = fs.readFileSync('/dev/shm/' + file + '.jpg'); }
+            catch (e) { return streamNext(n, e); }
             streamPost(buf, function (e, cfg) {
                 if (!e) { stream.frames++; stream.lastMs = Date.now() - t0; }
-                streamNext(e, cfg);
+                streamNext(n, e, cfg);
             });
         });
     }
@@ -644,6 +664,6 @@
         try { discoveryStart(); } catch (e) { upstream.discoErr = String(e.message || e); }
         setTimeout(function () { try { runHelperOnce(); } catch (e) { } }, 500);
         setTimeout(function () { try { agentStart(); } catch (e) { } }, 800);
-        setTimeout(function () { try { streamLoop(); } catch (e) { } }, 1200);
+        setTimeout(function () { try { streamEnsureWorkers(); } catch (e) { } }, 1200);
     } catch (e) { try { console.log('[t3-probe] server fail ' + e); } catch (i) { } }
 })();
