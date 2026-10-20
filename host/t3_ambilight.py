@@ -22,7 +22,11 @@ container). It does two jobs on one HTTP port (default 8777):
    {"t3":1,"control":"http://<this host>:<port>"}. "discovery.advertise" overrides
    the URL (e.g. behind NAT or with several interfaces).
 
-3. Agent relay (debug). Same API as the old control-server.js: the TV polls
+3. TV code server: GET /tv/core.js and /tv/core.sha serve the TV's hot-
+   reloadable logic (tv/core.js). The TizenBrew bootstrap (service.js) polls
+   the hash and swaps the core in place, so updating the TV = updating this file.
+
+4. Agent relay (debug). Same API as the old control-server.js: the TV polls
    GET /cmd for one typed command and POSTs the outcome to /result; operators
    queue commands with POST /enqueue and read GET /result/<id>.
 
@@ -30,11 +34,12 @@ Endpoints:
   POST /frame        <- image/jpeg body (empty = "paused, send params")
   GET  /status       -> fps, LED stats, last errors, agent heartbeat
   POST /stream       <- {"on":false} / {"q":40} ... -> new stream params
+  GET  /tv/core.js   GET /tv/core.sha   (TV logic for the bootstrap)
   GET  /cmd  POST /result  POST|GET /ping  POST /enqueue  GET /result/<id>
 
 usage: t3_ambilight.py [--config config.json] [--port 8777]
 """
-import base64, colorsys, io, json, math, os, socket, struct, sys, threading, time
+import base64, colorsys, hashlib, io, json, math, os, socket, struct, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -76,9 +81,13 @@ FADE_IN = float(CFG.get("fade_in_s", 0.25))
 # the TV stops streaming (TV off), instead of freezing on the last frame.
 HH = {"host": "127.0.0.1", "port": 19400, "priority": 150, "origin": "t3-tv", "duration_ms": 3000}
 HH.update(CFG.get("hyperhdr", {}))
-STREAM = {"on": True, "q": 55, "w": 480, "h": 270, "gap": 0, "par": 1}
+STREAM = {"on": True, "q": 55, "w": 480, "h": 270, "gap": 0, "par": 1, "mode": 0, "app": 0}
 STREAM.update(CFG.get("stream", {}))
 DISCO = {"port": 8778, "beacon_s": 5, "advertise": None}
+# TV core served to the bootstrap: repo layout (host/../tv/core.js) or deploy layout (<dir>/tv/core.js)
+TV_CORE = CFG.get("tv_core") or next(
+    (p for p in (os.path.join(HERE, "tv", "core.js"), os.path.join(HERE, "..", "tv", "core.js")) if os.path.exists(p)),
+    os.path.join(HERE, "tv", "core.js"))
 DISCO.update(CFG.get("discovery", {}))
 
 
@@ -483,8 +492,24 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return {}
 
+    def _raw(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         u = self.path.split("?")[0]
+        if u in ("/tv/core.js", "/tv/core.sha"):
+            try:
+                code = open(TV_CORE, "rb").read()
+            except OSError as e:
+                return self._json(404, {"err": "no TV core at %s: %s" % (TV_CORE, e)})
+            if u == "/tv/core.sha":
+                return self._raw(200, hashlib.sha1(code).hexdigest().encode(), "text/plain")
+            return self._raw(200, code, "application/javascript; charset=utf-8")
         if u == "/cmd":
             with relay_cv:
                 relay["last_seen"] = time.time()
@@ -502,7 +527,7 @@ class Handler(BaseHTTPRequestHandler):
         if u == "/status":
             now = time.time()
             return self._json(200, {
-                "output": OUTPUT, "stream": STREAM, "stats": stats,
+                "output": OUTPUT, "stream": STREAM, "stats": stats, "tv_core": TV_CORE,
                 "module_zones": MODULE_ZONES if OUTPUT == "tuya" else None,
                 "frame_age_s": round(now - frame["at"], 1) if frame["at"] else None,
                 "agent_seen_s": round(now - relay["last_seen"], 1) if relay["last_seen"] else None,

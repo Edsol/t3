@@ -1,152 +1,62 @@
 /*
- * HyperTizen T3 Probe - TizenBrew service module (Node.js, runs on the TV)
+ * T3 Ambilight - TizenBrew service module (Node.js, runs on the TV): BOOTSTRAP.
  *
- * v6.2: NO SERVER ADDRESS IN CODE. The host is found by LAN discovery (UDP
- * 8778) or pinned via GET /config?control=<url> / the agent 'config' op; the
- * choice is saved on the TV (see SERVER CONFIG + DISCOVERY below).
+ * Small and meant to rarely change. It:
+ *  1. finds the host (host/t3_ambilight.py): a URL saved on the TV, else LAN
+ *     discovery (UDP 8778 broadcast "T3-DISCOVER" + listening for the host's
+ *     beacons {"t3":1,"control":url}); a discovered host that stops answering
+ *     for 30s is looked up again;
+ *  2. downloads the actual logic (tv/core.js, served at <host>/tv/core.js) and
+ *     runs it; every 30s it checks <host>/tv/core.sha and hot-swaps the core in
+ *     this same process when it changed. Updating the TV = copying core.js to
+ *     the host: no TizenBrew reload, no tag, no jsDelivr, no duplicate services.
+ *  3. owns the HTTP port 8101: /config and /boot here, everything else is
+ *     passed to the core.
  *
- * v6.0: FRAME STREAM. The app captures the screen continuously (JPEG via dbus
- * into /dev/shm) and POSTs each frame to <server>/frame on the host
- * (host/t3_ambilight.py), which forwards it to HyperHDR (or drives the LEDs
- * itself). The agent below stays as a debug channel on the same host.
+ * Trust model: the TV runs code served by the host it discovered (or that you
+ * pinned) on your LAN. Pin a host to stop discovery from choosing one.
  *
- * v5.8: adds a REMOTE AGENT. The app polls the host for one typed command at
- * a time, runs it inside the app sandbox, and POSTs the result back. This lets
- * us drive diagnostics and the capture work WITHOUT re-deploying the TizenBrew
- * module every time. All ops act on the user's own device; exec is restricted
- * to a fixed whitelist of SYSTEM binaries (python2.7, dbus-send).
+ * HTTP (http://<TV-IP>:8101):
+ *   /config                     current host + where it came from
+ *   /config?control=http://h:p  pin that host (saved on the TV)
+ *   /config?reset=1             forget it, use LAN discovery
+ *   /boot                       bootstrap + core status;  /boot?reload=1 re-fetch core
  *
- * Findings so far:
- *  - card1 openable; dbus system -> samsung.tizen.dcapture . RequestCaptureToFileSync
- *    succeeds (retVal 0, 480x270) BUT the PNG it writes is unreadable to our app.
- *  - raw frame is NV21 480x270; /dev/shm/shm_libsecv_capture holds only a 120B
- *    descriptor, not the pixels.
- *  - app can exec SYSTEM binaries (dbus-send works; python2.7 now spawns, but its
- *    loader cannot find libpython2.7.so.1.0 -> exit 127, under investigation via
- *    the remote agent's find/ls ops).
- *
- * HTTP endpoints (http://<TV-IP>:8101):
- *   /         env + shm info          /native  dlopen/mount feasibility
- *   /find     what libs the app sees  /helper  last python-probe output
- *   /shminfo  dbus capture + shm hdr  /shms    dbus capture + all /dev/shm
- *   /shot     grayscale BMP from Y    /img     last reconstructed image
- *   /bench    dbus capture timing     /grab    legacy file attempt
- *   /agent    remote-agent status     /config  server address (get/pin/reset)
- *
- * Node v4/v5 => ES5 only.
+ * Node v4 on Tizen 3 => ES5 only.
  */
 (function () {
     'use strict';
 
     var fs = require('fs');
     var http = require('http');
-    var cp = require('child_process');
+    var vm = require('vm');
 
-    var VERSION = 'v6.3';
+    var BOOT_VERSION = 'boot-7.0';
     var PORT = 8101;
-    var DBUS = '/usr/bin/dbus-send';
-    var NAME = 'samsung.tizen.dcapture';
-    var OBJ = '/samsung/tizen/dcapture';
-    var METHOD = NAME + '.RequestCaptureToFileSync';
-    var SHM = '/dev/shm/shm_libsecv_capture';
-
-    var lastImage = null; // { buf, ct }
-    var helperReport = 'helper not run yet';
-    var agentState = { control: null, lastPoll: 0, lastErr: null, ran: 0 };
-
-    function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return '(' + e.code + ')'; } }
-
-    // libpython2.7.so.1.0 exists in the firmware but the loader cannot find it
-    // (exit 127): the sandboxed process does not inherit the right search path.
-    // Try the known system lib dirs via LD_LIBRARY_PATH (read-only).
-    var PY_LIBDIRS = ['/usr/lib', '/lib', '/usr/lib/python2.7',
-        '/usr/lib/python2.7/lib-dynload', '/usr/lib/python2.7/config',
-        '/usr/local/lib', '/opt/usr/lib'];
-    function findPyLibDir() {
-        for (var i = 0; i < PY_LIBDIRS.length; i++) {
-            try { if (fs.statSync(PY_LIBDIRS[i] + '/libpython2.7.so.1.0').isFile()) return PY_LIBDIRS[i]; } catch (e) { }
-        }
-        try {
-            var names = fs.readdirSync('/usr/lib');
-            for (var j = 0; j < names.length; j++) if (names[j].indexOf('libpython2.7') === 0) return '/usr/lib';
-        } catch (e) { }
-        return null;
-    }
-    function pyEnv() {
-        var env = {}; for (var k in process.env) env[k] = process.env[k];
-        var dir = findPyLibDir();
-        env.LD_LIBRARY_PATH = (dir ? dir + ':' : '') + PY_LIBDIRS.join(':')
-            + (env.LD_LIBRARY_PATH ? ':' + env.LD_LIBRARY_PATH : '');
-        return env;
-    }
-
-    // Read-only: what does OUR sandboxed process actually see? For each candidate
-    // dir, its entry count and any file matching 'libpython'/'libsec-video'.
-    function findLibs() {
-        var dirs = ['/usr/lib', '/lib', '/usr/lib/python2.7',
-            '/usr/lib/python2.7/lib-dynload', '/usr/lib/python2.7/config',
-            '/usr/local/lib', '/opt/usr/lib', '/ro/usr/lib', '/usr/lib/python2.7/plat-linux2'];
-        var o = {};
-        for (var i = 0; i < dirs.length; i++) {
-            var d = dirs[i]; var row = {};
-            try {
-                var names = fs.readdirSync(d);
-                row.count = names.length;
-                row.match = names.filter(function (n) {
-                    return n.indexOf('libpython') === 0 || n.indexOf('libsec-video') === 0;
-                });
-            } catch (e) { row.err = e.code || String(e); }
-            o[d] = row;
-        }
-        var files = ['/usr/lib/libpython2.7.so.1.0', '/usr/lib/libsec-video-capture.so.0',
-            '/usr/bin/python2.7', '/usr/bin/dbus-send'];
-        o._stat = {};
-        for (var j = 0; j < files.length; j++) {
-            try { var st = fs.statSync(files[j]); o._stat[files[j]] = { size: st.size, mode: (st.mode & 0x1ff).toString(8) }; }
-            catch (e) { o._stat[files[j]] = e.code || String(e); }
-        }
-        return o;
-    }
-    function runHelperOnce() {
-        var script = '/home/owner/share/tmp/cap.py';
-        var env = pyEnv();
-        helperReport = 'running python on ' + script + '\nfound libdir=' + findPyLibDir()
-            + '\nLD_LIBRARY_PATH=' + env.LD_LIBRARY_PATH + '\n';
-        try {
-            cp.execFile('/usr/bin/python2.7', [script],
-                { timeout: 25000, maxBuffer: 8 << 20, env: env }, function (err, so, se) {
-                    helperReport += 'python exit=' + (err ? (err.code != null ? err.code : String(err)) : 0)
-                        + '\n--- stdout ---\n' + String(so || '')
-                        + '\n--- stderr ---\n' + String(se || '');
-                });
-        } catch (e) { helperReport = 'spawn error: ' + (e && e.stack || e); }
-    }
-
-    /* ============== SERVER CONFIG + DISCOVERY (v6.2) ==============
-     * No server address in the code. The host URL (host/t3_ambilight.py) comes
-     * from, in order:
-     *  1. a config file saved on the TV, set via GET /config?control=<url> on
-     *     this module's HTTP server or by the host through the agent 'config' op;
-     *  2. LAN discovery: the TV broadcasts "T3-DISCOVER" on UDP 8778 and listens
-     *     there for the host's replies/periodic beacons {"t3":1,"control":url}.
-     * A discovered server that stops answering for 30s is looked up again.    */
     var CONFIG_DIR = '/opt/usr/home/owner/share/tmp/t3';
     var CONFIG_FILE = CONFIG_DIR + '/config.json';
     var DISCOVERY_PORT = 8778;
-    var upstream = { control: null, source: 'none', lastOk: 0, lastBeacon: 0, discoErr: null };
-    var discoveryProbe = null;   // set by discoveryStart(): broadcast a lookup now
 
+    var upstream = { control: null, source: 'none', lastOk: 0, lastBeacon: 0, discoErr: null };
+    var boot = { version: BOOT_VERSION, coreVersion: null, coreSha: null, loadedAt: 0, checks: 0, err: null };
+    var core = null;
+    var discoveryProbe = null;
+    var checkTimer = null;
+
+    function errText(e) { return String((e && (e.code || e.message)) || e); }
     function parseUrl(u) {
         var m = /^http:\/\/([^:\/]+):?(\d+)?/.exec(u || '');
         return m ? { host: m[1], port: m[2] ? +m[2] : 80 } : null;
     }
+
+    /* ---------------- host address: saved config + discovery ---------------- */
     function loadConfig() {
         try {
             var c = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
             if (parseUrl(c.control)) { upstream.control = c.control; upstream.source = 'file'; }
         } catch (e) { }
     }
-    // control = url -> pin this server (persisted); control = null -> back to discovery
+    // control = url -> pin that host (persisted); control = null -> back to discovery
     function saveConfig(control) {
         if (control) {
             if (!parseUrl(control)) throw new Error('bad url: ' + control);
@@ -158,12 +68,13 @@
             upstream.control = null; upstream.source = 'none';
             if (discoveryProbe) discoveryProbe();
         }
+        scheduleCheck(500);
     }
     function discoveryStart() {
         var dgram = require('dgram'), sock;
         try { sock = dgram.createSocket({ type: 'udp4', reuseAddr: true }); }
-        catch (e) { upstream.discoErr = String(e.message || e); return; }
-        sock.on('error', function (e) { upstream.discoErr = String(e.code || e.message || e); });
+        catch (e) { upstream.discoErr = errText(e); return; }
+        sock.on('error', function (e) { upstream.discoErr = errText(e); });
         sock.on('message', function (msg) {
             var m;
             try { m = JSON.parse(msg.toString()); } catch (e) { return; }
@@ -171,13 +82,14 @@
             upstream.lastBeacon = Date.now();
             if (upstream.source === 'file' || upstream.control === m.control) return;
             upstream.control = m.control; upstream.source = 'discovery';
+            scheduleCheck(200);
         });
         sock.bind(DISCOVERY_PORT, function () {
-            try { sock.setBroadcast(true); } catch (e) { upstream.discoErr = 'setBroadcast: ' + (e.message || e); }
+            try { sock.setBroadcast(true); } catch (e) { upstream.discoErr = 'setBroadcast: ' + errText(e); }
             discoveryProbe = function () {
                 var b = new Buffer('T3-DISCOVER');
                 sock.send(b, 0, b.length, DISCOVERY_PORT, '255.255.255.255', function (e) {
-                    if (e) upstream.discoErr = String(e.code || e.message || e);
+                    if (e) upstream.discoErr = errText(e);
                 });
             };
             (function loop() {
@@ -187,483 +99,96 @@
             })();
         });
     }
-    /* ============ END SERVER CONFIG + DISCOVERY ============ */
 
-    /* ====================== REMOTE AGENT ====================== *
-     * Polls the host for one typed command, runs it, posts back.
-     * Ops: ls, stat, find, readhex, exec (whitelist), dlopen, writefile, grab, config.
-     * Lets us iterate from the host without re-deploying this module.        */
-    var POLL_MS = 250;
-    var EXEC_WHITELIST = ['/usr/bin/python2.7', '/usr/bin/dbus-send', '/bin/ls', '/usr/bin/env'];
-
-    function agentHttp(method, path, body, cb) {
+    /* ---------------- core loader (hot reload) ---------------- */
+    function hostGet(path, cb) {
         var u = parseUrl(upstream.control);
         if (!u) return cb(new Error('no server yet'));
-        var data = body ? new Buffer(JSON.stringify(body)) : null;
-        var opts = { host: u.host, port: u.port, path: path, method: method,
-            headers: { 'Content-Type': 'application/json' } };
-        if (data) opts.headers['Content-Length'] = data.length;
-        var req = http.request(opts, function (res) {
-            var b = ''; res.on('data', function (c) { b += c; });
+        var req = http.get({ host: u.host, port: u.port, path: path }, function (res) {
+            var chunks = [];
+            res.on('data', function (c) { chunks.push(c); });
             res.on('end', function () {
+                if (res.statusCode !== 200) return cb(new Error('HTTP ' + res.statusCode + ' ' + path));
                 upstream.lastOk = Date.now();
-                try { cb(null, b ? JSON.parse(b) : {}); } catch (e) { cb(e); }
+                cb(null, Buffer.concat(chunks).toString('utf8'));
             });
         });
-        req.on('error', function (e) { cb(e); });
-        if (data) req.write(data);
-        req.end();
+        req.setTimeout(8000, function () { req.abort(); });
+        req.on('error', cb);
     }
-    function agentLdEnv(extra) {
-        var env = {}; for (var k in process.env) env[k] = process.env[k];
-        if (extra) for (var k2 in extra) env[k2] = extra[k2];
-        if (!env.LD_LIBRARY_PATH) env.LD_LIBRARY_PATH = PY_LIBDIRS.join(':');
-        return env;
-    }
-    var AGENT_OPS = {
-        ls: function (a, cb) {
-            var names = fs.readdirSync(a.path);
-            cb(null, { path: a.path, count: names.length, entries: names.map(function (n) {
-                var p = a.path.replace(/\/$/, '') + '/' + n;
-                try { var st = fs.statSync(p); return { name: n, size: st.size, mode: (st.mode & 0x1ff).toString(8), dir: st.isDirectory() }; }
-                catch (e) { return { name: n, err: e.code || String(e) }; }
-            }) });
-        },
-        stat: function (a, cb) {
-            var st = fs.statSync(a.path);
-            cb(null, { path: a.path, size: st.size, mode: (st.mode & 0x1ff).toString(8),
-                dir: st.isDirectory(), file: st.isFile(), link: st.isSymbolicLink() });
-        },
-        find: function (a, cb) {
-            var needle = a.needle || 'libpython'; var out = {};
-            for (var i = 0; i < PY_LIBDIRS.length; i++) {
-                try {
-                    var ns = fs.readdirSync(PY_LIBDIRS[i]);
-                    out[PY_LIBDIRS[i]] = { count: ns.length, match: ns.filter(function (n) { return n.indexOf(needle) >= 0; }) };
-                } catch (e) { out[PY_LIBDIRS[i]] = { err: e.code || String(e) }; }
-            }
-            cb(null, out);
-        },
-        readhex: function (a, cb) {
-            // Guard: reading char/DRM devices with readSync hangs the whole Node
-            // event loop (no EOF). Refuse known-blocking device paths; only read
-            // regular files. This keeps the agent from locking up on probes.
-            if (/^\/dev\/(dri\/|mem$|kmem$|fb\d|watchdog)/.test(a.path)) {
-                return cb(new Error('refused: char/DRM device would block readSync (' + a.path + ')'));
-            }
-            try {
-                var st = fs.statSync(a.path);
-                if (!st.isFile()) return cb(new Error('refused: not a regular file (' + a.path + ')'));
-            } catch (e) { return cb(e); }
-            var fd = fs.openSync(a.path, 'r');
-            var len = a.len || 256; var buf = new Buffer(len);
-            var n = fs.readSync(fd, buf, 0, len, a.off || 0); fs.closeSync(fd);
-            cb(null, { path: a.path, off: a.off || 0, read: n, hex: buf.slice(0, n).toString('hex') });
-        },
-        exec: function (a, cb) {
-            if (EXEC_WHITELIST.indexOf(a.bin) < 0) return cb(new Error('bin not whitelisted: ' + a.bin));
-            cp.execFile(a.bin, a.argv || [], { timeout: a.timeout || 25000, maxBuffer: 8 << 20, env: agentLdEnv(a.env) },
-                function (err, so, se) {
-                    cb(null, { bin: a.bin, argv: a.argv, exit: err ? (err.code != null ? err.code : String(err)) : 0,
-                        stdout: String(so || ''), stderr: String(se || '') });
-                });
-        },
-        dlopen: function (a, cb) {
-            try { process.dlopen({ exports: {} }, a.lib); cb(null, { lib: a.lib, result: 'loaded (unexpected for non-addon)' }); }
-            catch (de) {
-                var msg = String(de.message || de);
-                var ok = /self-register|NODE_MODULE|Module did|init|symbol/i.test(msg);
-                cb(null, { lib: a.lib, result: ok ? 'dlopen-OK (lib loaded; not a node addon)' : msg.slice(0, 200) });
-            }
-        },
-        writefile: function (a, cb) {
-            fs.writeFileSync(a.path, a.content);
-            cb(null, { path: a.path, size: fs.statSync(a.path).size });
-        },
-        // One round-trip capture: trigger a dbus screen capture into /dev/shm,
-        // read the resulting JPEG, and return its bytes as hex. Collapses the
-        // old 3-call cycle (exec+stat+readhex) into a single agent reply, which
-        // removes 2 poll-interval waits per frame -> much higher ambilight fps.
-        grab: function (a, cb) {
-            var q = (a && a.q) || 60;
-            var dir = '/dev/shm';
-            var file = 't3grab';
-            var path = dir + '/' + file + '.jpg';
-            var args = ['--system', '--print-reply', '--reply-timeout=4000', '--type=method_call',
-                '--dest=' + NAME, OBJ, METHOD,
-                'int32:0', 'int32:0', 'int32:1', 'int32:480', 'int32:270', 'int32:' + q,
-                'string:' + dir, 'string:' + file];
-            cp.execFile(DBUS, args, { timeout: 6000, maxBuffer: 1 << 20 }, function (err) {
-                try {
-                    var buf = fs.readFileSync(path);
-                    cb(null, { path: path, size: buf.length, hex: buf.toString('hex') });
-                } catch (e) { cb(e); }
-            });
-        },
-        // Pin the TV to a server ({control: url}, persisted) or go back to
-        // discovery ({control: null}). Answered before the switch takes effect.
-        config: function (a, cb) {
-            saveConfig(a.control || null);
-            cb(null, { upstream: upstream, configFile: CONFIG_FILE });
-        }
+    var ctx = {
+        upstream: upstream,
+        boot: boot,
+        saveConfig: saveConfig,
+        reload: function () { boot.coreSha = null; scheduleCheck(100); }
     };
-    function agentRun(cmd) {
-        agentState.ran++;
-        function done(err, data) {
-            agentHttp('POST', '/result', { id: cmd.id, ok: !err, data: data,
-                err: err ? (err.code || String(err.message || err)) : undefined }, function () { });
-        }
-        var fn = AGENT_OPS[cmd.op];
-        if (!fn) return done(new Error('unknown op ' + cmd.op));
-        try { fn(cmd.args || {}, done); } catch (e) { done(e); }
+    function startCore(code, sha) {
+        var factory = vm.runInThisContext(code, { filename: 't3-core.js' });   // syntax errors: old core keeps running
+        if (typeof factory !== 'function') throw new Error('core.js is not a function expression');
+        if (core) { try { core.stop(); } catch (e) { } core = null; }
+        core = factory(require, ctx);
+        boot.coreSha = sha; boot.coreVersion = core.version; boot.loadedAt = Date.now(); boot.err = null;
     }
-    function agentPing() {
-        agentHttp('POST', '/ping', { version: VERSION,
-            uid: (function () { try { return process.getuid(); } catch (e) { return -1; } })(),
-            smack: (function () { try { return fs.readFileSync('/proc/self/attr/current', 'utf8').replace(/\0/g, '').trim(); } catch (e) { return '?'; } })()
-        }, function () { });
+    function scheduleCheck(ms) {
+        if (checkTimer) clearTimeout(checkTimer);
+        checkTimer = setTimeout(checkCore, ms);
     }
-    function agentPoll() {
-        if (agentState.control !== upstream.control) {   // new/changed server: say hello
-            agentState.control = upstream.control;
-            if (upstream.control) agentPing();
-        }
-        agentHttp('GET', '/cmd', null, function (err, cmd) {
-            agentState.lastPoll = Date.now();
-            if (err) { agentState.lastErr = String(err.code || err.message || err); }
-            else { agentState.lastErr = null; if (cmd && cmd.op) agentRun(cmd); }
-            setTimeout(agentPoll, err ? 2000 : POLL_MS);
-        });
-    }
-    function agentStart() {
-        setTimeout(agentPoll, POLL_MS);
-    }
-    /* ==================== END REMOTE AGENT ==================== */
-
-    /* ==================== FRAME STREAM (v6.0) ====================
-     * Push mode: the TV captures continuously and POSTs each JPEG to
-     * <server>/frame. No per-frame command round-trip, so the rate is bound
-     * only by the capture itself (~7-8 fps, independent of resolution: the
-     * cost is the dbus-send spawn + the daemon's capture). The server's JSON
-     * reply steers the loop ({on, q, w, h, gap, par}), so it can be tuned or
-     * paused remotely. 'par' runs that many capture workers side by side
-     * (own file each) to overlap the fixed per-capture cost (v6.3).
-     * While paused, an empty POST every 2s keeps asking for new params.   */
-    var STREAM_FILE = 't3stream';
-    var MAX_PAR = 4;
-    var stream = { on: true, q: 55, w: 480, h: 270, gap: 0, par: 1, frames: 0, lastErr: null, lastMs: 0 };
-    var streamWorkers = {};
-
-    function streamPar() { return Math.max(1, Math.min(MAX_PAR, stream.par | 0)); }
-    function streamEnsureWorkers() {
-        for (var i = 0; i < streamPar(); i++) {
-            if (!streamWorkers[i]) {
-                streamWorkers[i] = true;
-                (function (n) { setTimeout(function () { streamLoop(n); }, n * 40); })(i);
-            }
-        }
-    }
-    function streamPost(buf, cb) {
-        var u = parseUrl(upstream.control);
-        if (!u) return cb(new Error('no server yet'));
-        var req = http.request({ host: u.host, port: u.port, path: '/frame', method: 'POST',
-            headers: { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length } }, function (res) {
-            var b = ''; res.on('data', function (c) { b += c; });
-            res.on('end', function () {
-                upstream.lastOk = Date.now();
-                try { cb(null, b ? JSON.parse(b) : {}); } catch (e) { cb(e); }
-            });
-        });
-        req.setTimeout(5000, function () { req.abort(); });
-        req.on('error', function (e) { cb(e); });
-        req.write(buf);
-        req.end();
-    }
-    function streamNext(n, err, cfg) {
-        if (!err && cfg) for (var k in cfg) if (k in stream && k !== 'frames') stream[k] = cfg[k];
-        if (n >= streamPar()) { streamWorkers[n] = false; return; }   // par lowered: retire
-        streamEnsureWorkers();                                         // par raised: spawn
-        if (err) { stream.lastErr = String(err.code || err.message || err); return setTimeout(function () { streamLoop(n); }, 2000); }
-        stream.lastErr = null;
-        setTimeout(function () { streamLoop(n); }, stream.on ? (stream.gap || 0) : 2000);
-    }
-    function streamLoop(n) {
-        n = n || 0;
-        if (!upstream.control) { stream.lastErr = 'no server yet'; return setTimeout(function () { streamLoop(n); }, 2000); }
-        if (!stream.on) {
-            if (n > 0) { streamWorkers[n] = false; return; }   // one worker is enough to poll
-            return streamPost(new Buffer(0), function (e, cfg) { streamNext(n, e, cfg); });
-        }
-        var t0 = Date.now(), file = STREAM_FILE + n;
-        var args = ['--system', '--print-reply', '--reply-timeout=4000', '--type=method_call',
-            '--dest=' + NAME, OBJ, METHOD,
-            'int32:0', 'int32:0', 'int32:1', 'int32:' + stream.w, 'int32:' + stream.h, 'int32:' + stream.q,
-            'string:/dev/shm', 'string:' + file];
-        cp.execFile(DBUS, args, { timeout: 6000, maxBuffer: 1 << 20 }, function () {
-            var buf;
-            try { buf = fs.readFileSync('/dev/shm/' + file + '.jpg'); }
-            catch (e) { return streamNext(n, e); }
-            streamPost(buf, function (e, cfg) {
-                if (!e) { stream.frames++; stream.lastMs = Date.now() - t0; }
-                streamNext(n, e, cfg);
+    function checkCore() {
+        boot.checks++;
+        function next() { scheduleCheck(core ? 30000 : 3000); }
+        hostGet('/tv/core.sha', function (e, sha) {
+            if (e) { boot.err = errText(e); return next(); }
+            sha = sha.trim();
+            if (!sha || sha === boot.coreSha) return next();
+            hostGet('/tv/core.js', function (e2, code) {
+                if (e2) boot.err = errText(e2);
+                else {
+                    try { startCore(code, sha); }
+                    catch (e3) { boot.err = 'core start: ' + errText(e3); boot.coreSha = sha; }   // don't retry a broken core
+                }
+                next();
             });
         });
     }
 
-    // fire one capture through the system service; cb(replyObj)
-    function dbusCapture(dir, file, app, mode, w, h, comp, q, cb) {
-        var args = ['--system', '--print-reply', '--reply-timeout=4000', '--type=method_call',
-            '--dest=' + NAME, OBJ, METHOD,
-            'int32:' + app, 'int32:' + mode, 'int32:' + comp,
-            'int32:' + w, 'int32:' + h, 'int32:' + q, 'string:' + dir, 'string:' + file];
-        cp.execFile(DBUS, args, { timeout: 6000, maxBuffer: 1 << 20 }, function (err, stdout) {
-            var ints = []; var re = /int32\s+(-?\d+)/g, m;
-            while ((m = re.exec(String(stdout)))) ints.push(parseInt(m[1], 10));
-            cb({ retVal: ints[0], ret_w: ints[1], ret_h: ints[2], raw: String(stdout).replace(/\s+/g, ' ').slice(0, 160) });
-        });
-    }
-
-    function shmInfo() {
-        var o = {};
-        try { o.size = fs.statSync(SHM).size; } catch (e) { o.statErr = e.code || String(e); }
-        try {
-            var fd = fs.openSync(SHM, 'r');
-            var head = new Buffer(256); var n = fs.readSync(fd, head, 0, 256, 0);
-            fs.closeSync(fd);
-            o.head_hex = head.slice(0, n).toString('hex');
-        } catch (e) { o.readErr = e.code || String(e); }
-        return o;
-    }
-
-    function readShm(path) { return fs.readFileSync(path || SHM); }
-
-    // list every /dev/shm entry with size + first 32 bytes, flag frame-sized ones
-    function listShms() {
-        var out = [];
-        var names;
-        try { names = fs.readdirSync('/dev/shm'); } catch (e) { return { err: e.code || String(e) }; }
-        for (var i = 0; i < names.length; i++) {
-            var p = '/dev/shm/' + names[i];
-            var row = { name: names[i], path: p };
-            try {
-                var st = fs.statSync(p);
-                row.size = st.size;
-                row.looks = (st.size >= 120000) ? 'frame-sized?' : '';
-                var fd = fs.openSync(p, 'r'); var hb = new Buffer(32); var n = fs.readSync(fd, hb, 0, 32, 0); fs.closeSync(fd);
-                row.head = hb.slice(0, n).toString('hex');
-            } catch (e) { row.err = e.code || String(e); }
-            out.push(row);
-        }
-        out.sort(function (a, b) { return (b.size || 0) - (a.size || 0); });
-        return out;
-    }
-
-    // Build a 24-bit BMP (bottom-up) from a grayscale plane: buf[off + y*w + x] = luma.
-    function bmpFromLuma(buf, off, w, h) {
-        var rowRaw = w * 3;
-        var pad = (4 - (rowRaw % 4)) % 4;
-        var rowSize = rowRaw + pad;
-        var imgSize = rowSize * h;
-        var fileSize = 54 + imgSize;
-        var out = new Buffer(fileSize);
-        out.fill(0);
-        out.write('BM', 0);
-        out.writeUInt32LE(fileSize, 2);
-        out.writeUInt32LE(54, 10);
-        out.writeUInt32LE(40, 14);
-        out.writeInt32LE(w, 18);
-        out.writeInt32LE(h, 22);
-        out.writeUInt16LE(1, 26);
-        out.writeUInt16LE(24, 28);
-        out.writeUInt32LE(imgSize, 34);
-        for (var y = h - 1; y >= 0; y--) {
-            var srow = off + y * w;
-            var d = 54 + (h - 1 - y) * rowSize;
-            for (var x = 0; x < w; x++) {
-                var v = buf[srow + x] || 0;
-                out[d] = v; out[d + 1] = v; out[d + 2] = v; d += 3;
-            }
-        }
-        return out;
-    }
-
-    // ---- native-feasibility probe (read-only) ----
-    function candidateDirs() {
-        var l = []; function add(d) { if (d && l.indexOf(d) < 0) l.push(d); }
-        try { add(process.cwd()); } catch (e) { }
-        add(process.env.HOME); add(process.env.TMPDIR); add('/tmp');
-        add('/opt/usr/home/owner/share/tmp'); add('/opt/usr/apps');
-        return l;
-    }
-    function mountFor(dir) {
-        try {
-            var mi = fs.readFileSync('/proc/self/mountinfo', 'utf8').split('\n');
-            var best = null, bestLen = -1;
-            for (var i = 0; i < mi.length; i++) {
-                var mp = mi[i].split(' ')[4];
-                if (mp && dir.indexOf(mp) === 0 && mp.length > bestLen) { best = mi[i]; bestLen = mp.length; }
-            }
-            if (!best) return null;
-            return { mountpoint: best.split(' ')[4], noexec: best.indexOf('noexec') >= 0 };
-        } catch (e) { return { err: e.code || String(e) }; }
-    }
-    function dirWritable(dir) {
-        var p = dir + '/.t3w';
-        try { fs.writeFileSync(p, 'x'); var ok = fs.readFileSync(p, 'utf8') === 'x'; try { fs.unlinkSync(p); } catch (e) { } return ok; }
-        catch (e) { return e.code || String(e); }
-    }
-    function dlopenExisting() {
-        var libs = ['/usr/lib/libdrm.so.2', '/usr/lib/libteec.so', '/usr/lib/libpng.so.3', '/lib/libz.so.1'];
-        for (var i = 0; i < libs.length; i++) {
-            try { fs.statSync(libs[i]); } catch (e) { continue; }
-            try {
-                process.dlopen({ exports: {} }, libs[i]);
-                return { lib: libs[i], result: 'loaded (unexpected)' };
-            } catch (de) {
-                var m = String(de.message || de);
-                var ok = /self-register|NODE_MODULE|Module did|init|symbol/i.test(m);
-                return { lib: libs[i], result: ok ? 'dlopen-OK (loaded, not an addon)' : m.slice(0, 160) };
-            }
-        }
-        return { result: 'no candidate lib found' };
-    }
-    function nativeProbe() {
-        var o = { version: VERSION, dlopen: dlopenExisting(), dirs: {} };
-        var ds = candidateDirs();
-        for (var i = 0; i < ds.length; i++) o.dirs[ds[i]] = { writable: dirWritable(ds[i]), mount: mountFor(ds[i]) };
-        return o;
-    }
-
+    /* ---------------- HTTP :8101 ---------------- */
     function send(res, code, obj) {
         res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify(obj, null, 2));
     }
     function parseQ(url) {
-        var q = {}; (url.split('?')[1] || '').split('&').forEach(function (kv) {
+        var q = {};
+        (url.split('?')[1] || '').split('&').forEach(function (kv) {
             var a = kv.split('='); if (a[0]) q[a[0]] = decodeURIComponent(a[1] || '');
         });
         return q;
     }
+    function route(req, res) {
+        var url = req.url || '/';
+        if (url.indexOf('/config') === 0) {
+            var qc = parseQ(url);
+            try {
+                if (qc.reset) saveConfig(null);
+                else if (qc.control) saveConfig(qc.control);
+            } catch (e) { return send(res, 400, { error: errText(e) }); }
+            return send(res, 200, { boot: BOOT_VERSION, upstream: upstream, configFile: CONFIG_FILE });
+        }
+        if (url.indexOf('/boot') === 0) {
+            if (parseQ(url).reload) ctx.reload();
+            return send(res, 200, { boot: boot, upstream: upstream });
+        }
+        if (core && core.handle) {
+            try { return core.handle(req, res); } catch (e) { return send(res, 500, { error: errText(e), boot: boot }); }
+        }
+        send(res, 503, { boot: boot, upstream: upstream, hint: 'core not loaded yet (waiting for the host)' });
+    }
 
     try {
-        var server = http.createServer(function (req, res) {
-            var url = req.url || '/';
-
-            if (url.indexOf('/img') === 0) {
-                if (lastImage) { res.writeHead(200, { 'Content-Type': lastImage.ct, 'Access-Control-Allow-Origin': '*' }); res.end(lastImage.buf); }
-                else { res.writeHead(404); res.end('no image yet'); }
-                return;
-            }
-
-            if (url.indexOf('/native') === 0) { send(res, 200, nativeProbe()); return; }
-
-            if (url.indexOf('/find') === 0) { send(res, 200, { version: VERSION, libs: findLibs() }); return; }
-
-            if (url.indexOf('/agent') === 0) {
-                send(res, 200, { version: VERSION, upstream: upstream, agent: agentState, stream: stream,
-                    seenMsAgo: agentState.lastPoll ? Date.now() - agentState.lastPoll : null });
-                return;
-            }
-
-            // /config                      -> current server + where it came from
-            // /config?control=http://h:p   -> pin that server (saved on the TV)
-            // /config?reset=1              -> forget it, use LAN discovery
-            if (url.indexOf('/config') === 0) {
-                var qc = parseQ(url);
-                try {
-                    if (qc.reset) saveConfig(null);
-                    else if (qc.control) saveConfig(qc.control);
-                } catch (e) { send(res, 400, { error: String(e.message || e) }); return; }
-                send(res, 200, { version: VERSION, upstream: upstream, configFile: CONFIG_FILE });
-                return;
-            }
-
-            if (url.indexOf('/helper') === 0) {
-                res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
-                res.end(helperReport);
-                return;
-            }
-
-            if (url.indexOf('/shms') === 0) {
-                dbusCapture('/tmp', 't3cap', 0, 0, 0, 0, 0, 90, function (rep) {
-                    send(res, 200, { version: VERSION, capture: rep, shms: listShms() });
-                });
-                return;
-            }
-
-            if (url.indexOf('/shminfo') === 0) {
-                dbusCapture('/tmp', 't3cap', 0, 0, 0, 0, 0, 90, function (rep) {
-                    send(res, 200, { version: VERSION, capture: rep, shm: SHM, shmInfo: shmInfo() });
-                });
-                return;
-            }
-
-            if (url.indexOf('/shot') === 0) {
-                var q = parseQ(url);
-                var off = +(q.off || 0);
-                var w = +(q.w || 480), h = +(q.h || 270);
-                var bus = q.bus === undefined ? '1' : q.bus;
-                var shmPath = q.shm ? ('/dev/shm/' + q.shm.replace(/^.*\//, '')) : SHM;
-                function build() {
-                    var r = { version: VERSION, off: off, w: w, h: h, shm: shmPath };
-                    try {
-                        var buf = readShm(shmPath);
-                        r.shmSize = buf.length;
-                        if (off + w * h > buf.length) { r.error = 'offset+w*h exceeds shm size'; send(res, 200, r); return; }
-                        var min = 255, max = 0, sum = 0, cnt = 0, step = Math.max(1, Math.floor((w * h) / 4096));
-                        for (var i = 0; i < w * h; i += step) { var v = buf[off + i]; if (v < min) min = v; if (v > max) max = v; sum += v; cnt++; }
-                        r.luma = { min: min, max: max, avg: Math.round(sum / cnt) };
-                        lastImage = { buf: bmpFromLuma(buf, off, w, h), ct: 'image/bmp' };
-                        r.image = '/img';
-                    } catch (e) { r.error = e.code || String(e); }
-                    send(res, 200, r);
-                }
-                if (bus === '1' || bus === 'true') dbusCapture('/tmp', 't3cap', 0, 0, 0, 0, 0, 90, function () { build(); });
-                else build();
-                return;
-            }
-
-            if (url.indexOf('/bench') === 0) {
-                var qb = parseQ(url); var n = +(qb.n || 10); var i = 0; var samples = [];
-                (function one() {
-                    if (i >= n) {
-                        var tot = 0; for (var k = 0; k < samples.length; k++) tot += samples[k];
-                        var avg = samples.length ? tot / samples.length : 0;
-                        send(res, 200, { n: samples.length, ms_avg: Math.round(avg), fps_avg: avg ? +(1000 / avg).toFixed(1) : 0, samples_ms: samples });
-                        return;
-                    }
-                    i++; var t0 = Date.now();
-                    dbusCapture('/tmp', 't3b', 0, 0, 0, 0, 0, 90, function () {
-                        try { fs.readFileSync(SHM); } catch (e) { }
-                        samples.push(Date.now() - t0); one();
-                    });
-                })();
-                return;
-            }
-
-            if (url.indexOf('/grab') === 0) {
-                var dir = '/tmp', file = 't3cap', target = dir + '/' + file + '.png', pre;
-                try { fs.writeFileSync(target, ''); fs.chmodSync(target, 0x1b6); pre = 'ok'; } catch (e) { pre = e.code; }
-                dbusCapture(dir, file, 0, 0, 0, 0, 0, 90, function (rep) {
-                    var r = { precreate: pre, capture: rep };
-                    try { r.size = fs.statSync(target).size; } catch (e) { r.readErr = e.code; }
-                    send(res, 200, r);
-                });
-                return;
-            }
-
-            var env = { ok: true, version: VERSION, port: PORT, node: process.version, smack: readText('/proc/self/attr/current').replace(/\0/g, '').trim(), shm: shmInfo() };
-            try { env.uid = process.getuid(); } catch (e) { }
-            env.upstream = upstream;
-            env.hint = 'see /config /agent /find /helper';
-            send(res, 200, env);
-        });
-        server.on('error', function (e) { try { console.log('[t3-probe] http err ' + e.code); } catch (i) { } });
-        server.listen(PORT, '0.0.0.0', function () { try { console.log('[t3-probe ' + VERSION + '] :' + PORT); } catch (i) { } });
-        try { loadConfig(); } catch (e) { }
-        try { discoveryStart(); } catch (e) { upstream.discoErr = String(e.message || e); }
-        setTimeout(function () { try { runHelperOnce(); } catch (e) { } }, 500);
-        setTimeout(function () { try { agentStart(); } catch (e) { } }, 800);
-        setTimeout(function () { try { streamEnsureWorkers(); } catch (e) { } }, 1200);
-    } catch (e) { try { console.log('[t3-probe] server fail ' + e); } catch (i) { } }
+        var srv = http.createServer(route);
+        srv.on('error', function (e) { boot.httpErr = errText(e); });
+        srv.listen(PORT, '0.0.0.0');
+    } catch (e) { boot.httpErr = errText(e); }
+    try { loadConfig(); } catch (e) { }
+    try { discoveryStart(); } catch (e) { upstream.discoErr = errText(e); }
+    scheduleCheck(1000);
 })();
